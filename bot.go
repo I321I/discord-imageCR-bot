@@ -5,10 +5,33 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
+)
+
+var (
+	guilds_channels = make(map[string]([]string))
+	commands        = []*discordgo.ApplicationCommand{
+		{
+			Name:        "setChannelToImageBot",
+			Description: "設定此頻道為圖片存取處之一",
+		},
+	}
+	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
+		"setChannelToImageBot": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			if slices.Contains(guilds_channels[i.GuildID], i.ChannelID) {
+			}
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: fmt.Sprintf("成功新增頻道！新增後頻道列表：%v", guilds_channels),
+				},
+			})
+		},
+	}
 )
 
 func main() {
@@ -34,6 +57,12 @@ func main() {
 		fmt.Println("連線 Discord 失敗:", err)
 		return
 	}
+	registeredCommands := make([]*discordgo.ApplicationCommand, len(commands))
+	for i, v := range registeredCommands {
+		cmd, err := sess.ApplicationCommandCreate(sess.State.User.ID)
+		registeredCommands[i] = v
+	}
+
 	defer sess.Close()
 
 	fmt.Println("機器人已成功啟動！按下 CTRL-C 退出。")
@@ -52,7 +81,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	// 簡單的文字響應
-	if m.Content == "ping" {
-		s.ChannelMessageSend(m.ChannelID, "Pong!")
+	if slices.Contains(guilds_channels, "m.channel") {
+		if m.Content == "ping" {
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("pong! %s", m.ChannelID))
+		}
 	}
 }
