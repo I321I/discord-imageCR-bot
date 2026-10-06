@@ -80,7 +80,16 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
+	var (
+		guilds   []string
+		channels []string
+	)
+	for key, arr := range guilds_channels {
+		guilds = append(guilds, key)
+
+	}
 	// 簡單的文字響應
+
 	if slices.Contains(guilds_channels, "m.channel") {
 		if m.Content == "ping" {
 			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("pong! %s", m.ChannelID))
