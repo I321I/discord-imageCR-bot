@@ -22,7 +22,14 @@ var (
 	}
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
 		"setChannelToImageBot": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-			if slices.Contains(guilds_channels[i.GuildID], i.ChannelID) {
+			if slices.Contains(GetChannels(), i.ChannelID) {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: fmt.Sprintf("頻道已存在！目前頻道列表：%v", guilds_channels),
+					},
+				})
+				return
 			}
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -80,19 +87,30 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	var (
-		guilds   []string
-		channels []string
-	)
-	for key, arr := range guilds_channels {
-		guilds = append(guilds, key)
+	//確認是已登錄的channel
+	if slices.Contains(GetChannels(), "m.channel") {
 
-	}
-	// 簡單的文字響應
-
-	if slices.Contains(guilds_channels, "m.channel") {
+		// 簡單的文字響應
 		if m.Content == "ping" {
 			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("pong! %s", m.ChannelID))
 		}
 	}
+}
+
+func GetGuilds() []string {
+	var guilds []string
+	for guild, _ := range guilds_channels {
+		guilds = append(guilds, guild)
+	}
+	return guilds
+}
+
+func GetChannels() []string {
+	var channels []string
+	for _, arr := range guilds_channels {
+		for _, channel := range arr {
+			channels = append(channels, channel)
+		}
+	}
+	return channels
 }
