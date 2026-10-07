@@ -36,51 +36,133 @@ var (
 	guilds_channels = make(map[string]([]string))
 	commands        = []*discordgo.ApplicationCommand{
 		{
-			Name:        "set-channel-to-image_bot",
-			Description: "設定此頻道為圖片存取處之一",
+			Name:        "channel",
+			Description: "頻道設定",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "add",
+					Description: "設定為圖片存取處之一",
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "remove",
+					Description: "移除自圖片存取處",
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "list",
+					Description: "列出圖片存取處",
+				},
+			},
 		},
 	}
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
-		"set-channel-to-image_bot": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-			if slices.Contains(GetChannels(), i.ChannelID) {
-				content, err := guilds_channels_nameList(s, guilds_channels)
-				if err != nil {
-					s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-						Type: discordgo.InteractionResponseChannelMessageWithSource,
-						Data: &discordgo.InteractionResponseData{
-							Content: err.Error(),
-						},
-					})
-					return
-				}
-				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-					Type: discordgo.InteractionResponseChannelMessageWithSource,
-					Data: &discordgo.InteractionResponseData{
-						Content: fmt.Sprintf("頻道已存在！目前頻道列表：\n%v", content),
-					},
-				})
+		"channel": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			options := i.ApplicationCommandData().Options
+			if len(options) == 0 {
 				return
 			}
-			guilds_channels[i.GuildID] = append(guilds_channels[i.GuildID], i.ChannelID)
-			content, err := guilds_channels_nameList(s, guilds_channels)
-			if err != nil {
-				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-					Type: discordgo.InteractionResponseChannelMessageWithSource,
-					Data: &discordgo.InteractionResponseData{
-						Content: err.Error(),
-					},
-				})
-				return
+			switch options[0].Name {
+			case "add":
+				handdleChannelAdd(s, i)
+			case "remove":
+				handdleChannelRemove(s, i)
+			case "list":
+				handdleChannelList(s, i)
 			}
+		}}
+)
+
+func handdleChannelAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if slices.Contains(GetChannels(), i.ChannelID) {
+		content, err := guilds_channels_nameList(s, guilds_channels)
+		if err != nil {
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: fmt.Sprintf("成功新增頻道！新增後頻道列表：\n%v", content),
+					Content: err.Error(),
 				},
 			})
-		},
+			return
+		}
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("頻道已存在！目前頻道列表：\n%v", content),
+			},
+		})
+		return
 	}
-)
+	guilds_channels[i.GuildID] = append(guilds_channels[i.GuildID], i.ChannelID)
+	content, err := guilds_channels_nameList(s, guilds_channels)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: err.Error(),
+			},
+		})
+		return
+	}
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("成功新增頻道！新增後頻道列表：\n%v", content),
+		},
+	})
+}
+
+func handdleChannelRemove(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if !slices.Contains(GetChannels(), i.ChannelID) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "此頻道不存在於頻道列表中",
+			},
+		})
+		return
+	}
+	for GuildId, arr := range guilds_channels {
+		if index := slices.Index(arr, i.ChannelID); index >= 0 {
+			guilds_channels[GuildId] = slices.Delete(arr, index, index+1)
+		}
+	}
+	content, err := guilds_channels_nameList(s, guilds_channels)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: err.Error(),
+			},
+		})
+		return
+	}
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("移除此頻道自頻道列表，目前頻道列表：\n%v", content),
+		},
+	})
+}
+func handdleChannelList(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	content, err := guilds_channels_nameList(s, guilds_channels)
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: err.Error(),
+			},
+		})
+		return
+	}
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("頻道列表：\n%v", content),
+		},
+	})
+}
 
 func init() {
 	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
