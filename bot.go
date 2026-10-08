@@ -36,23 +36,29 @@ var (
 	guilds_channels = make(map[string]([]string))
 	commands        = []*discordgo.ApplicationCommand{
 		{
-			Name:        "channel",
-			Description: "頻道設定",
+			Name:             "channel",
+			Description:      "頻道設定",
+			IntegrationTypes: &[]discordgo.ApplicationIntegrationType{discordgo.ApplicationIntegrationGuildInstall},
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Name:        "add",
-					Description: "設定為圖片存取處之一",
+					Description: "設定頻道為圖片存取處之一",
 				},
 				{
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Name:        "remove",
-					Description: "移除自圖片存取處",
+					Description: "移除頻道自圖片存取處",
 				},
 				{
 					Type:        discordgo.ApplicationCommandOptionSubCommand,
 					Name:        "list",
-					Description: "列出圖片存取處",
+					Description: "列出此伺服器為圖片存取處的頻道",
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "id",
+					Description: "顯示此頻道ID",
 				},
 			},
 		},
@@ -70,13 +76,15 @@ var (
 				handdleChannelRemove(s, i)
 			case "list":
 				handdleChannelList(s, i)
+			case "id":
+				handdleChannelId(s, i)
 			}
 		}}
 )
 
 func handdleChannelAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if slices.Contains(GetChannels(), i.ChannelID) {
-		content, err := guilds_channels_nameList(s, guilds_channels)
+		content, err := guilds_channels_nameList(s, guilds_channels, i.GuildID)
 		if err != nil {
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -95,7 +103,7 @@ func handdleChannelAdd(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 	guilds_channels[i.GuildID] = append(guilds_channels[i.GuildID], i.ChannelID)
-	content, err := guilds_channels_nameList(s, guilds_channels)
+	content, err := guilds_channels_nameList(s, guilds_channels, i.GuildID)
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -128,7 +136,7 @@ func handdleChannelRemove(s *discordgo.Session, i *discordgo.InteractionCreate) 
 			guilds_channels[GuildId] = slices.Delete(arr, index, index+1)
 		}
 	}
-	content, err := guilds_channels_nameList(s, guilds_channels)
+	content, err := guilds_channels_nameList(s, guilds_channels, GuildId)
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -146,7 +154,7 @@ func handdleChannelRemove(s *discordgo.Session, i *discordgo.InteractionCreate) 
 	})
 }
 func handdleChannelList(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	content, err := guilds_channels_nameList(s, guilds_channels)
+	content, err := guilds_channels_nameList(s, guilds_channels, GuildId)
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -160,6 +168,15 @@ func handdleChannelList(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: fmt.Sprintf("頻道列表：\n%v", content),
+		},
+	})
+}
+
+func handdleChannelId(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("頻道ID：%v", i.ChannelID),
 		},
 	})
 }
@@ -251,34 +268,34 @@ func GetChannels() []string {
 	return channels
 }
 
-func guilds_channels_nameList(s *discordgo.Session, guilds_channels map[string][]string) (content string, err error) {
+func guilds_channels_nameList(s *discordgo.Session, guilds_channels map[string][]string, guildId string) (content string, err error) {
 	var str string
-	for guildId, arr := range guilds_channels {
-		guild, err := s.Guild(guildId)
+	guild, err := s.Guild(guildId)
+	arr := guilds_channels[guildId]
+	if err != nil {
+		return "", err
+	}
+	var guildName string = guild.Name
+	//不顯示無Channel的Guild
+	if len(guilds_channels[guildId]) > 0 {
+		str = str + fmt.Sprintf("伺服器：%v\n", guildName)
+	}
+	for i, channelId := range arr {
+		channel, err := s.Channel(channelId)
 		if err != nil {
 			return "", err
 		}
-		var guildName string = guild.Name
-		//不顯示無Channel的Guild
-		if len(guilds_channels[guildId]) > 0 {
-			str = str + fmt.Sprintf("伺服器：%v\n", guildName)
-		}
-		for i, channelId := range arr {
-			channel, err := s.Channel(channelId)
-			if err != nil {
-				return "", err
-			}
-			var channelName string = channel.Name
-			if i == 0 && i == len(arr)-1 {
-				str = str + fmt.Sprintf("[%v]\n", channelName)
-			} else if i == 0 {
-				str = str + fmt.Sprintf("[%v", channelName)
-			} else if i == len(arr)-1 {
-				str = str + fmt.Sprintf("、%v]\n", channelName)
-			} else {
-				str = str + fmt.Sprintf("、%v", channelName)
-			}
+		var channelName string = channel.Name
+		if i == 0 && i == len(arr)-1 {
+			str = str + fmt.Sprintf("[%v]\n", channelName)
+		} else if i == 0 {
+			str = str + fmt.Sprintf("[%v", channelName)
+		} else if i == len(arr)-1 {
+			str = str + fmt.Sprintf("、%v]\n", channelName)
+		} else {
+			str = str + fmt.Sprintf("、%v", channelName)
 		}
 	}
+
 	return str, err
 }
