@@ -1,0 +1,278 @@
+package commands
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+
+	"discordbot/internal/store"
+
+	"github.com/bwmarrin/discordgo"
+)
+
+// API 是指令 handler 需要的 Discord 方法，*discordgo.Session 直接滿足。
+type API interface {
+	InteractionRespond(interaction *discordgo.Interaction, resp *discordgo.InteractionResponse, options ...discordgo.RequestOption) error
+	InteractionResponseEdit(interaction *discordgo.Interaction, newresp *discordgo.WebhookEdit, options ...discordgo.RequestOption) (*discordgo.Message, error)
+}
+
+// StateReader 讀取 gateway state，*discordgo.State 直接滿足。
+type StateReader interface {
+	Guild(guildID string) (*discordgo.Guild, error)
+	Channel(channelID string) (*discordgo.Channel, error)
+}
+
+// IndexHooks 在來源頻道新增/移除成功後被呼叫。
+type IndexHooks interface {
+	ChannelAdded(guildID, channelID string)
+	ChannelRemoved(channelID string)
+}
+
+// NopIndexHooks 不做任何事（索引完成前使用）。
+type NopIndexHooks struct{}
+
+func (NopIndexHooks) ChannelAdded(guildID, channelID string) {}
+func (NopIndexHooks) ChannelRemoved(channelID string)        {}
+
+const (
+	msgStorageFailed      = "儲存設定失敗，請稍後再試"
+	msgUnsupportedChannel = "此頻道類型不支援"
+	msgChannelNotFound    = "找不到此頻道，請稍後再試"
+)
+
+// botPermissions 是 bot 在來源頻道需要的權限（依顯示順序）。
+var botPermissions = []struct {
+	perm int64
+	name string
+}{
+	{discordgo.PermissionViewChannel, "檢視頻道"},
+	{discordgo.PermissionReadMessageHistory, "讀取訊息歷史"},
+	{discordgo.PermissionSendMessages, "傳送訊息"},
+	{discordgo.PermissionAttachFiles, "附加檔案"},
+	{discordgo.PermissionManageMessages, "管理訊息"},
+	{discordgo.PermissionAddReactions, "新增反應"},
+}
+
+var (
+	errAlreadyAdded = errors.New("頻道已存在")
+	errNotListed    = errors.New("頻道不在列表中")
+)
+
+type channelHandler struct {
+	st    *store.Store
+	state StateReader
+	api   API
+	hooks IndexHooks
+}
+
+// NewChannelHandler 回傳 /channel 的 handler。
+func NewChannelHandler(st *store.Store, state StateReader, api API, hooks IndexHooks) Handler {
+	h := &channelHandler{st: st, state: state, api: api, hooks: hooks}
+	return h.handle
+}
+
+func (h *channelHandler) handle(ctx context.Context, i *discordgo.InteractionCreate) {
+	if i.GuildID == "" {
+		return
+	}
+	options := i.ApplicationCommandData().Options
+	if len(options) == 0 {
+		return
+	}
+	switch options[0].Name {
+	case "add":
+		// 會寫入儲存頻道，可能超過 3 秒，先送 deferred 回應再補上內容。
+		if !deferEphemeral(h.api, i) {
+			return
+		}
+		h.add(ctx, i)
+	case "remove":
+		if !deferEphemeral(h.api, i) {
+			return
+		}
+		h.remove(ctx, i)
+	case "list":
+		h.list(i)
+	case "id":
+		h.reply(i, fmt.Sprintf("頻道ID：%v", i.ChannelID))
+	}
+}
+
+// add 在 deferred 回應之後執行，結果以 edit 補上。
+func (h *channelHandler) add(ctx context.Context, i *discordgo.InteractionCreate) {
+	ch, err := h.state.Channel(i.ChannelID)
+	if err != nil {
+		h.edit(i, msgChannelNotFound)
+		return
+	}
+	if ch.Type != discordgo.ChannelTypeGuildText && ch.Type != discordgo.ChannelTypeGuildNews {
+		h.edit(i, msgUnsupportedChannel)
+		return
+	}
+
+	err = h.st.Update(ctx, func(d *store.Data) error {
+		// interaction ID 就是當下的 snowflake，當作設定時間點。
+		if !d.AddChannel(i.GuildID, i.ChannelID, i.ID) {
+			return errAlreadyAdded
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errAlreadyAdded):
+		h.editWithList(i, "頻道已存在！目前頻道列表：\n%v", "")
+		return
+	case err != nil:
+		log.Printf("新增來源頻道 %s 時寫入儲存頻道失敗：%v", i.ChannelID, err)
+		h.edit(i, msgStorageFailed)
+		return
+	}
+	h.hooks.ChannelAdded(i.GuildID, i.ChannelID)
+	h.editWithList(i, "成功新增頻道！新增後頻道列表：\n%v", missingPermissionsWarning(i.AppPermissions))
+}
+
+// remove 在 deferred 回應之後執行，結果以 edit 補上。
+func (h *channelHandler) remove(ctx context.Context, i *discordgo.InteractionCreate) {
+	err := h.st.Update(ctx, func(d *store.Data) error {
+		if !d.RemoveChannel(i.GuildID, i.ChannelID) {
+			return errNotListed
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errNotListed):
+		h.edit(i, "此頻道不存在於頻道列表中")
+		return
+	case err != nil:
+		log.Printf("移除來源頻道 %s 時寫入儲存頻道失敗：%v", i.ChannelID, err)
+		h.edit(i, msgStorageFailed)
+		return
+	}
+	h.hooks.ChannelRemoved(i.ChannelID)
+	h.editWithList(i, "移除此頻道自頻道列表，目前頻道列表：\n%v", "")
+}
+
+func (h *channelHandler) list(i *discordgo.InteractionCreate) {
+	h.replyWithList(i, "頻道列表：\n%v", "")
+}
+
+// replyWithList 以 format 包住目前伺服器的頻道列表回覆；suffix 接在最後。
+func (h *channelHandler) replyWithList(i *discordgo.InteractionCreate, format, suffix string) {
+	content, err := h.channelList(i.GuildID)
+	if err != nil {
+		h.reply(i, err.Error())
+		return
+	}
+	h.reply(i, fmt.Sprintf(format, content)+suffix)
+}
+
+// editWithList 同 replyWithList，但以 edit 補上 deferred 回應的內容。
+func (h *channelHandler) editWithList(i *discordgo.InteractionCreate, format, suffix string) {
+	content, err := h.channelList(i.GuildID)
+	if err != nil {
+		h.edit(i, err.Error())
+		return
+	}
+	h.edit(i, fmt.Sprintf(format, content)+suffix)
+}
+
+// channelList 回傳 "伺服器：X\n[a、b]\n"；沒有頻道時回空字串。
+// state 查不到的頻道（例如 bot 離線時被刪除）顯示頻道 ID。
+func (h *channelHandler) channelList(guildID string) (string, error) {
+	guild, err := h.state.Guild(guildID)
+	if err != nil {
+		return "", err
+	}
+	ids := h.st.Snapshot().Channels(guildID)
+	if len(ids) == 0 {
+		return "", nil
+	}
+	names := make([]string, 0, len(ids))
+	for _, id := range ids {
+		ch, err := h.state.Channel(id)
+		if err != nil {
+			names = append(names, id)
+			continue
+		}
+		names = append(names, ch.Name)
+	}
+	return fmt.Sprintf("伺服器：%v\n[%v]\n", guild.Name, strings.Join(names, "、")), nil
+}
+
+func missingPermissionsWarning(perms int64) string {
+	if perms&discordgo.PermissionAdministrator != 0 {
+		return ""
+	}
+	var missing []string
+	for _, p := range botPermissions {
+		if perms&p.perm == 0 {
+			missing = append(missing, p.name)
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return "\n⚠️ 機器人在此頻道缺少以下權限，圖片可能無法正常處理：" + strings.Join(missing, "、")
+}
+
+func (h *channelHandler) reply(i *discordgo.InteractionCreate, content string) {
+	respondEphemeral(h.api, i, content)
+}
+
+func (h *channelHandler) edit(i *discordgo.InteractionCreate, content string) {
+	editResponse(h.api, i, content)
+}
+
+// ChannelDeleted 處理頻道被刪除：若是來源頻道，從設定移除並寫回儲存頻道，成功後通知索引。
+// 寫入失敗只記 log（記憶體中的資料不變）。
+func ChannelDeleted(ctx context.Context, st *store.Store, hooks IndexHooks, guildID, channelID string) {
+	err := st.Update(ctx, func(d *store.Data) error {
+		if !d.RemoveChannel(guildID, channelID) {
+			return errNotListed
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errNotListed):
+		return
+	case err != nil:
+		log.Printf("來源頻道 %s 已被刪除，但寫入儲存頻道失敗：%v", channelID, err)
+		return
+	}
+	log.Printf("來源頻道 %s 已被刪除，已從設定移除", channelID)
+	hooks.ChannelRemoved(channelID)
+}
+
+// deferEphemeral 送出 ephemeral 的 deferred 回應；失敗時記 log 並回 false。
+func deferEphemeral(api API, i *discordgo.InteractionCreate) bool {
+	err := api.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Flags: discordgo.MessageFlagsEphemeral},
+	})
+	if err != nil {
+		log.Printf("回覆 interaction %s（deferred）失敗：%v", i.ID, err)
+		return false
+	}
+	return true
+}
+
+// editResponse 補上 deferred 回應的內容。
+func editResponse(api API, i *discordgo.InteractionCreate, content string) {
+	if _, err := api.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
+		log.Printf("補上 interaction %s 的回應失敗：%v", i.ID, err)
+	}
+}
+
+func respondEphemeral(api API, i *discordgo.InteractionCreate, content string) {
+	err := api.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+	if err != nil {
+		log.Printf("回覆 interaction %s 失敗：%v", i.ID, err)
+	}
+}
