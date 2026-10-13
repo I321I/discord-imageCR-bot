@@ -172,10 +172,10 @@ func TestGate4_RapidOCR_IdleTimerRacesWithRequests(t *testing.T) {
 	}
 }
 
-// Close 與進行中的請求競爭：Close 會等進行中的請求結束（最多 Timeout）；之後 worker 已回收、不再啟動。
+// Close 與進行中的請求競爭：Close 不等進行中的請求，直接殺掉 worker；請求以錯誤返回，之後 worker 已回收、不再啟動。
 func TestGate4_RapidOCR_CloseDuringInFlightRequest(t *testing.T) {
 	r, logPath := fakeRapidOCR(t, "hang-first-start")
-	r.Timeout = 500 * time.Millisecond
+	r.Timeout = 10 * time.Second
 	done := make(chan error, 1)
 	go func() {
 		_, err := r.RecognizeText(context.Background(), solid(10, 10, color.White))
@@ -191,13 +191,12 @@ func TestGate4_RapidOCR_CloseDuringInFlightRequest(t *testing.T) {
 		if err == nil {
 			t.Error("進行中的請求應回錯誤")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("進行中的請求沒有結束")
 	}
-	if closeTook > 3*time.Second {
+	if closeTook > 2*time.Second {
 		t.Errorf("Close 花了 %v", closeTook)
 	}
-	t.Logf("Close 等待進行中請求 %v（Timeout=%v）", closeTook, r.Timeout)
 	pids := startedPIDs(t, logPath)
 	if len(pids) != 1 || processAlive(pids[0]) {
 		t.Errorf("worker 應已回收且不再啟動，pids %v", pids)

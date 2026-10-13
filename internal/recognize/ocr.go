@@ -61,17 +61,58 @@ func scaledRGBA(img image.Image, src image.Rectangle, w, h int) *image.RGBA {
 	return dst
 }
 
-// RecognizeWithFallback 先辨識字幕區域 subtitle（PrepareForOCR 的結果）；沒讀到字（ErrNoText）時
-// 自動對整張 whole（PrepareWholeForOCR 的結果）再辨識一次（Q57 (b)）。其他錯誤直接回傳、不重試。
+// itemRecognizer 是能回傳文字框的 TextRecognizer（RapidOCR）；RecognizeWithFallback 用它判斷字幕區是否有直書框。
+type itemRecognizer interface {
+	RecognizeItems(ctx context.Context, img image.Image) ([]OCRItem, error)
+}
+
+// fallbackRecognizer 由排隊包裝（SerializeText）實作：佔用一個名額完成整個 RecognizeWithFallback，整張重試不重新排隊。
+type fallbackRecognizer interface {
+	recognizeWithFallback(ctx context.Context, subtitle, whole image.Image) (string, error)
+}
+
+// RecognizeWithFallback 辨識圖片文字：subtitle 為字幕區（PrepareForOCR 的結果），whole 為整張（PrepareWholeForOCR 的結果）。
+// 以下情況改辨識整張，並以整張的結果為準：
+//   - 圖片高 > 寬（whole 與原圖同比例）：直接辨識整張，不先讀字幕區；
+//   - 字幕區沒讀到字（ErrNoText，Q57 (b)）；
+//   - 字幕區讀到直書框（高/寬 ≥ 1.5；t 能回傳文字框時才判斷）。
+//
+// 字幕區的其他錯誤直接回傳、不重試。t 為 SerializeText 的包裝時，整個流程只排隊一次（整張重試接續處理）。
 func RecognizeWithFallback(ctx context.Context, t TextRecognizer, subtitle, whole image.Image) (string, error) {
-	text, err := t.RecognizeText(ctx, subtitle)
-	if !errors.Is(err, ErrNoText) {
+	if f, ok := t.(fallbackRecognizer); ok {
+		return f.recognizeWithFallback(ctx, subtitle, whole)
+	}
+	if b := whole.Bounds(); b.Dy() > b.Dx() {
+		return t.RecognizeText(ctx, whole)
+	}
+	text, useWhole, err := recognizeSubtitle(ctx, t, subtitle)
+	if !useWhole {
 		return text, err
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	return t.RecognizeText(ctx, whole)
+}
+
+// recognizeSubtitle 辨識字幕區；useWhole 為 true 表示要改辨識整張（沒讀到字或讀到直書框）。
+func recognizeSubtitle(ctx context.Context, t TextRecognizer, subtitle image.Image) (text string, useWhole bool, err error) {
+	ir, ok := t.(itemRecognizer)
+	if !ok {
+		text, err := t.RecognizeText(ctx, subtitle)
+		return text, errors.Is(err, ErrNoText), err
+	}
+	items, err := ir.RecognizeItems(ctx, subtitle)
+	if err != nil {
+		return "", errors.Is(err, ErrNoText), err
+	}
+	for _, b := range toBoxes(items) {
+		if b.vertical() {
+			return "", true, nil
+		}
+	}
+	text = JoinOCRItems(items)
+	return text, text == "", nil
 }
 
 // OCRItem 是 OCR 讀到的一個文字框：Box 為四個頂點 (x, y)，Text 為框內文字，Score 為信心度。
@@ -84,11 +125,17 @@ type OCRItem struct {
 // verticalRatio：文字框高/寬 ≥ 此值視為直書（RapidOCR 會把這種框轉 90 度再辨識）。
 const verticalRatio = 1.5
 
+// bubbleGapRatio：兩個直書欄的水平間距 ≤ 較寬欄寬度的此倍數、且垂直範圍有重疊時，視為同一對話框。
+const bubbleGapRatio = 1.0
+
 // span 是文字框在某一軸上的範圍。
 type span struct{ lo, hi float64 }
 
 func (s span) center() float64 { return (s.lo + s.hi) / 2 }
 func (s span) size() float64   { return s.hi - s.lo }
+
+// union 回傳同時涵蓋 s 與 o 的範圍。
+func (s span) union(o span) span { return span{min(s.lo, o.lo), max(s.hi, o.hi)} }
 
 // ocrBox 是文字框的外接矩形與文字。
 type ocrBox struct {
@@ -96,22 +143,37 @@ type ocrBox struct {
 	text string
 }
 
-// JoinOCRItems 把文字框組成文字：
-// 橫書框依垂直範圍分行（與目前行重疊 ≥ 較矮者 50% 視為同一行），行由上到下、行內由左到右；
-// 直書框（高/寬 ≥ 1.5）依水平範圍分欄（規則相同），欄由右至左、欄內由上到下；
-// 每行或每欄一行文字，橫書行在前、直書欄在後；最後套用 CleanOCRText。不依信心度過濾（RapidOCR 內建已過濾，Q66）。
-func JoinOCRItems(items []OCRItem) string {
-	var horizontal, vertical []ocrBox
+// vertical 回傳框是否為直書（高 > 0 且高/寬 ≥ 1.5）；零寬高的框不算直書。
+func (b ocrBox) vertical() bool {
+	return b.y.size() > 0 && b.y.size() >= verticalRatio*b.x.size()
+}
+
+// toBoxes 把 OCRItem 轉成外接矩形，略過空白文字。
+func toBoxes(items []OCRItem) []ocrBox {
+	var boxes []ocrBox
 	for _, it := range items {
 		if strings.TrimSpace(it.Text) == "" {
 			continue
 		}
 		b := ocrBox{x: span{it.Box[0][0], it.Box[0][0]}, y: span{it.Box[0][1], it.Box[0][1]}, text: it.Text}
 		for _, p := range it.Box[1:] {
-			b.x = span{min(b.x.lo, p[0]), max(b.x.hi, p[0])}
-			b.y = span{min(b.y.lo, p[1]), max(b.y.hi, p[1])}
+			b.x = b.x.union(span{p[0], p[0]})
+			b.y = b.y.union(span{p[1], p[1]})
 		}
-		if b.y.size() >= verticalRatio*b.x.size() {
+		boxes = append(boxes, b)
+	}
+	return boxes
+}
+
+// JoinOCRItems 把文字框組成文字：
+// 橫書框依垂直範圍分行（與目前行重疊 ≥ 較矮者 50% 視為同一行），行由上到下、行內由左到右以空白連接；
+// 直書框（高/寬 ≥ 1.5）依水平範圍分欄（規則相同），欄內由上到下；同一對話框的欄（相鄰欄水平間距 ≤ 較寬欄寬度、
+// 垂直範圍有重疊）由右至左接成一行（不加空白），不同對話框各一行，依最右欄的位置由右至左排列；
+// 橫書行在前、直書在後；最後套用 CleanOCRText。不依信心度過濾（RapidOCR 內建已過濾，Q66）。
+func JoinOCRItems(items []OCRItem) string {
+	var horizontal, vertical []ocrBox
+	for _, b := range toBoxes(items) {
+		if b.vertical() {
 			vertical = append(vertical, b)
 		} else {
 			horizontal = append(horizontal, b)
@@ -119,15 +181,17 @@ func JoinOCRItems(items []OCRItem) string {
 	}
 	var lines []string
 	// 橫書：依 y 分行，行由上到下，行內依 x 由左到右。
-	lines = append(lines, groupBoxes(horizontal, func(b ocrBox) span { return b.y }, func(b ocrBox) span { return b.x }, false)...)
-	// 直書：依 x 分欄，欄由右至左，欄內依 y 由上到下。
-	lines = append(lines, groupBoxes(vertical, func(b ocrBox) span { return b.x }, func(b ocrBox) span { return b.y }, true)...)
+	for _, g := range groupBoxes(horizontal, func(b ocrBox) span { return b.y }, func(b ocrBox) span { return b.x }, false) {
+		lines = append(lines, joinTexts(g, " "))
+	}
+	// 直書：依 x 分欄（由右至左），欄內依 y 由上到下；再把同一對話框的欄接成一行。
+	lines = append(lines, joinColumns(groupBoxes(vertical, func(b ocrBox) span { return b.x }, func(b ocrBox) span { return b.y }, true))...)
 	return CleanOCRText(strings.Join(lines, "\n"))
 }
 
 // groupBoxes 依 across 軸把文字框分組（與目前組的範圍重疊 ≥ 較小者 50% 視為同一組），
-// 組依 across 中心排序（reverse 為由大到小），組內依 along 軸由小到大，以空白連接成一行。
-func groupBoxes(boxes []ocrBox, across, along func(ocrBox) span, reverse bool) []string {
+// 組依 across 中心排序（reverse 為由大到小），組內依 along 軸由小到大。
+func groupBoxes(boxes []ocrBox, across, along func(ocrBox) span, reverse bool) [][]ocrBox {
 	sort.SliceStable(boxes, func(i, j int) bool {
 		if reverse {
 			return across(boxes[i]).center() > across(boxes[j]).center()
@@ -143,21 +207,79 @@ func groupBoxes(boxes []ocrBox, across, along func(ocrBox) span, reverse bool) [
 			if overlap >= 0.5*min(cur.size(), r.size()) {
 				last := len(groups) - 1
 				groups[last] = append(groups[last], b)
-				cur = span{min(cur.lo, r.lo), max(cur.hi, r.hi)}
+				cur = cur.union(r)
 				continue
 			}
 		}
 		groups = append(groups, []ocrBox{b})
 		cur = r
 	}
-	lines := make([]string, 0, len(groups))
 	for _, g := range groups {
 		sort.SliceStable(g, func(i, j int) bool { return along(g[i]).lo < along(g[j]).lo })
-		texts := make([]string, len(g))
-		for i, b := range g {
-			texts[i] = b.text
+	}
+	return groups
+}
+
+// joinTexts 以 sep 連接各框的文字。
+func joinTexts(g []ocrBox, sep string) string {
+	texts := make([]string, len(g))
+	for i, b := range g {
+		texts[i] = b.text
+	}
+	return strings.Join(texts, sep)
+}
+
+// joinColumns 把直書欄（已由右至左排序）依對話框分組：兩欄水平間距 ≤ 較寬欄寬度 × bubbleGapRatio
+// 且垂直範圍有重疊時相連，相連的欄（可經由其他欄間接相連）屬於同一對話框。
+// 每個對話框一行：欄由右至左直接連接；對話框依其最右欄的順序排列。
+func joinColumns(columns [][]ocrBox) []string {
+	type column struct {
+		x, y span
+		text string
+	}
+	cols := make([]column, len(columns))
+	for i, g := range columns {
+		c := column{x: g[0].x, y: g[0].y, text: joinTexts(g, " ")}
+		for _, b := range g[1:] {
+			c.x, c.y = c.x.union(b.x), c.y.union(b.y)
 		}
-		lines = append(lines, strings.Join(texts, " "))
+		cols[i] = c
+	}
+	// union-find：parent[i] 為欄 i 所屬對話框的代表（取最右，也就是索引最小的欄）。
+	parent := make([]int, len(cols))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(i int) int {
+		if parent[i] != i {
+			parent[i] = find(parent[i])
+		}
+		return parent[i]
+	}
+	for i := range cols {
+		for j := i + 1; j < len(cols); j++ {
+			a, b := cols[i], cols[j]
+			gap := max(a.x.lo, b.x.lo) - min(a.x.hi, b.x.hi)
+			yOverlap := min(a.y.hi, b.y.hi) - max(a.y.lo, b.y.lo)
+			if gap <= bubbleGapRatio*max(a.x.size(), b.x.size()) && yOverlap > 0 {
+				ri, rj := find(i), find(j)
+				parent[max(ri, rj)] = min(ri, rj)
+			}
+		}
+	}
+	var order []int
+	texts := map[int]string{}
+	for i, c := range cols {
+		r := find(i)
+		if _, ok := texts[r]; !ok {
+			order = append(order, r)
+		}
+		texts[r] += c.text
+	}
+	lines := make([]string, len(order))
+	for i, r := range order {
+		lines[i] = texts[r]
 	}
 	return lines
 }

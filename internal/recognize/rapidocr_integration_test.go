@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"image/color"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,7 +48,8 @@ func charHitRate(want, got string) float64 {
 	return float64(hit) / float64(total)
 }
 
-// 使用者提供的真實截圖，走與自動處理相同的流程：解碼 → 字幕區（沒字則整張）→ RapidOCR。
+// 使用者提供的真實截圖，走與自動處理相同的流程：解碼 → RecognizeWithFallback（字幕區；沒字、有直書框或直的圖則整張）→ RapidOCR。
+// 圖片不在 repo 中（版權），找不到的圖片略過。
 // 字幕與電視節目截圖：命中率（正確字元出現在結果中的比例）須 ≥ 90%（Q64）。
 // 漫畫只列部分文字，命中率先記錄、不判定失敗（待 Pi 試驗結果）。
 func TestRapidOCR_RealImages(t *testing.T) {
@@ -69,6 +71,10 @@ func TestRapidOCR_RealImages(t *testing.T) {
 	} {
 		t.Run(c.file, func(t *testing.T) {
 			data, err := os.ReadFile("testdata/" + c.file)
+			if errors.Is(err, fs.ErrNotExist) {
+				// 真實截圖有版權，只留在本機（.gitignore 排除），找不到就略過。
+				t.Skipf("找不到測試圖片 %s，略過", c.file)
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

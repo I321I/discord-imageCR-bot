@@ -11,6 +11,7 @@ import (
 	"image/png"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestHelperProcess 不是真正的測試：rapidocr 測試用 Go 測試二進位自身當假 OCR worker（不需 Python）。
@@ -69,10 +71,26 @@ func TestHelperProcess(t *testing.T) {
 		case mode == "garbage":
 			fmt.Println("not json")
 			continue
+		case mode == "big-respond-then-exit":
+			// 遠大於 pipe buffer 的回應，寫完立刻結束：最後一段還在 pipe 裡時行程已結束。
+			fmt.Printf("{\"id\":%d,\"items\":[{\"box\":[[0,0],[10,0],[10,5],[0,5]],\"text\":%q,\"score\":0.9}]}\n", req.ID, strings.Repeat("字", 300_000))
+			os.Exit(0)
 		case mode == "wrong-id":
 			req.ID += 100
 		case mode == "stderr":
 			fmt.Fprintln(os.Stderr, "worker 記錄一行")
+		case mode == "grandchild-hang":
+			// 孫行程繼承 stdout 並一直存在；worker 本身卡住不回應。
+			gc := exec.Command("sleep", "30")
+			gc.Stdout = os.Stdout
+			if err := gc.Start(); err != nil {
+				panic(err)
+			}
+			appendLine(logPath, fmt.Sprintf("grandchild %d", gc.Process.Pid))
+			time.Sleep(time.Hour)
+		case mode == "stderr-partial-exit":
+			fmt.Fprint(os.Stderr, "最後一行沒有換行")
+			os.Exit(3)
 		}
 		img, err := png.Decode(bytes.NewReader(req.PNG))
 		if err != nil {
@@ -80,7 +98,14 @@ func TestHelperProcess(t *testing.T) {
 			continue
 		}
 		b := img.Bounds()
-		fmt.Printf("{\"id\":%d,\"items\":[{\"box\":[[0,0],[10,0],[10,5],[0,5]],\"text\":\"%dx%d\",\"score\":0.9}]}\n", req.ID, b.Dx(), b.Dy())
+		box := "[[0,0],[10,0],[10,5],[0,5]]"
+		if mode == "vertical" {
+			box = "[[0,0],[5,0],[5,10],[0,10]]" // 直書框（高/寬 = 2）
+		}
+		fmt.Printf("{\"id\":%d,\"items\":[{\"box\":%s,\"text\":\"%dx%d\",\"score\":0.9}]}\n", req.ID, box, b.Dx(), b.Dy())
+		if mode == "respond-then-exit" {
+			os.Exit(0) // 回應後立刻結束：回應不可因為行程結束而遺失
+		}
 	}
 }
 
@@ -151,15 +176,18 @@ func startedPIDs(t *testing.T, logPath string) []int {
 	return pids
 }
 
-var _ TextRecognizer = (*RapidOCR)(nil)
+var (
+	_ TextRecognizer = (*RapidOCR)(nil)
+	_ itemRecognizer = (*RapidOCR)(nil)
+)
 
 func TestNewRapidOCR_Defaults(t *testing.T) {
 	r := NewRapidOCR()
 	if want := []string{"python3", "/app/ocr/ocr_worker.py"}; !slices.Equal(r.Command, want) {
 		t.Errorf("Command %q，預期 %q", r.Command, want)
 	}
-	if r.StartTimeout != 60*time.Second || r.Timeout != 90*time.Second || r.IdleTimeout != 5*time.Minute {
-		t.Errorf("StartTimeout %v、Timeout %v、IdleTimeout %v，預期 60s、90s（Q61）、5m（Q55）", r.StartTimeout, r.Timeout, r.IdleTimeout)
+	if r.StartTimeout != 60*time.Second || r.Timeout != 3*time.Minute || r.IdleTimeout != 5*time.Minute {
+		t.Errorf("StartTimeout %v、Timeout %v、IdleTimeout %v，預期 60s、3m（Q61 修改）、5m（Q55）", r.StartTimeout, r.Timeout, r.IdleTimeout)
 	}
 }
 
@@ -174,6 +202,37 @@ func TestRapidOCR_RoundTrip(t *testing.T) {
 	}
 	if got != "64x12" {
 		t.Errorf("worker 應收到 64x12 的 PNG 並回傳其文字，得到 %q", got)
+	}
+}
+
+func TestRapidOCR_RecognizeItems(t *testing.T) {
+	r, _ := fakeRapidOCR(t, "echo")
+	items, err := r.RecognizeItems(context.Background(), solid(64, 12, color.White))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []OCRItem{{Box: [4][2]float64{{0, 0}, {10, 0}, {10, 5}, {0, 5}}, Text: "64x12", Score: 0.9}}
+	if !slices.Equal(items, want) {
+		t.Errorf("得到 %+v，預期 %+v", items, want)
+	}
+}
+
+func TestRapidOCR_RecognizeItemsTinyImageWithoutWorker(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "echo")
+	if items, err := r.RecognizeItems(context.Background(), solid(1, 5, color.White)); err != nil || len(items) != 0 {
+		t.Errorf("寬或高 < 2px 應回空結果，得到 %v %v", items, err)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 0 {
+		t.Errorf("不應送給 worker，得到 %v", pids)
+	}
+}
+
+// 字幕區讀到直書框時，RecognizeWithFallback 經由 RapidOCR 的文字框改辨識整張。
+func TestRapidOCR_FallbackOnVerticalBox(t *testing.T) {
+	r, _ := fakeRapidOCR(t, "vertical")
+	got, err := RecognizeWithFallback(context.Background(), r, solid(64, 12, color.White), solid(128, 72, color.White))
+	if err != nil || got != "128x72" {
+		t.Errorf("應改用整張的結果，得到 %q %v", got, err)
 	}
 }
 
@@ -439,4 +498,189 @@ func TestRapidOCR_WorkerStderrGoesToLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "stderr 寫入 log", func() bool { return strings.Contains(buf.String(), "worker 記錄一行") })
+}
+
+// captureLog 把 log 輸出導到緩衝區（測試結束還原），回傳緩衝區。
+func captureLog(t *testing.T) *syncBuffer {
+	t.Helper()
+	var buf syncBuffer
+	flags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+	return &buf
+}
+
+// logLines 回傳 log 中 worker 記錄的每一行（去掉前綴）。
+func logLines(buf *syncBuffer) []string {
+	var out []string
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if rest, ok := strings.CutPrefix(l, "OCR worker："); ok {
+			out = append(out, rest)
+		}
+	}
+	return out
+}
+
+func TestWorkerLogWriter_BuffersUntilNewline(t *testing.T) {
+	buf := captureLog(t)
+	w := &workerLogWriter{}
+	w.Write([]byte("前半"))
+	if got := logLines(buf); len(got) != 0 {
+		t.Fatalf("還沒換行不應輸出，得到 %q", got)
+	}
+	w.Write([]byte("後半\n第二行\n\n  \n第三"))
+	w.Write([]byte("行\n"))
+	if got, want := logLines(buf), []string{"前半後半", "第二行", "第三行"}; !slices.Equal(got, want) {
+		t.Errorf("得到 %q，預期 %q", got, want)
+	}
+}
+
+func TestWorkerLogWriter_TruncatesLongLine(t *testing.T) {
+	buf := captureLog(t)
+	w := &workerLogWriter{}
+	chunk := []byte(strings.Repeat("字", 1000)) // 3000 bytes
+	for i := 0; i < 5; i++ {
+		w.Write(chunk)
+	}
+	w.Write([]byte("\n下一行\n"))
+	got := logLines(buf)
+	if len(got) != 2 || got[1] != "下一行" {
+		t.Fatalf("得到 %d 行：%q", len(got), got)
+	}
+	line, ok := strings.CutSuffix(got[0], workerLogTruncated)
+	if !ok {
+		t.Errorf("過長的行應標示截斷，得到結尾 %q", got[0][max(0, len(got[0])-30):])
+	}
+	if len(line) > workerMaxStderrLine || len(line) < workerMaxStderrLine-3 {
+		t.Errorf("截斷後長度 %d bytes，預期約 %d", len(line), workerMaxStderrLine)
+	}
+	if !utf8.ValidString(line) {
+		t.Error("截斷後應為合法 UTF-8")
+	}
+}
+
+func TestWorkerLogWriter_FlushWritesPartialLine(t *testing.T) {
+	buf := captureLog(t)
+	w := &workerLogWriter{}
+	w.Write([]byte("沒有換行"))
+	w.flush()
+	w.flush()
+	if got, want := logLines(buf), []string{"沒有換行"}; !slices.Equal(got, want) {
+		t.Errorf("得到 %q，預期 %q", got, want)
+	}
+}
+
+// worker 結束前最後一行 stderr 沒有換行，也要寫到 log。
+func TestRapidOCR_WorkerStderrPartialLineLoggedOnExit(t *testing.T) {
+	buf := captureLog(t)
+	r, _ := fakeRapidOCR(t, "stderr-partial-exit")
+	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err == nil {
+		t.Fatal("worker 結束應回錯誤")
+	}
+	if got := logLines(buf); !slices.Contains(got, "最後一行沒有換行") {
+		t.Errorf("log 應包含最後一行，得到 %q", got)
+	}
+}
+
+// Close 不等進行中的請求：直接殺掉 worker，進行中的請求以錯誤返回。
+func TestRapidOCR_CloseKillsInFlightRequest(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "hang-first-start")
+	r.Timeout = 30 * time.Second
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.RecognizeText(context.Background(), solid(10, 10, color.White))
+		done <- err
+	}()
+	waitFor(t, "worker 啟動", func() bool { return len(startedPIDs(t, logPath)) == 1 })
+	time.Sleep(100 * time.Millisecond) // 讓請求送出、進入等待回應
+	start := time.Now()
+	r.Close()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("Close 不應等進行中的請求，花了 %v", d)
+	}
+	select {
+	case err := <-done:
+		if err == nil || errors.Is(err, ErrNoText) {
+			t.Errorf("進行中的請求應回錯誤，得到 %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 後進行中的請求沒有返回")
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 1 || processAlive(pids[0]) {
+		t.Errorf("worker 應已被殺掉回收，pids %v", pids)
+	}
+}
+
+// 等待 ready 期間 Close：啟動中的 worker 也直接殺掉。
+func TestRapidOCR_CloseDuringStartup(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "no-ready")
+	r.StartTimeout = 30 * time.Second
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.RecognizeText(context.Background(), solid(10, 10, color.White))
+		done <- err
+	}()
+	waitFor(t, "worker 啟動", func() bool { return len(startedPIDs(t, logPath)) == 1 })
+	start := time.Now()
+	r.Close()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("Close 花了 %v", d)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("啟動中被 Close 應回錯誤")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 後啟動中的請求沒有返回")
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 1 || processAlive(pids[0]) {
+		t.Errorf("worker 應已被殺掉回收，pids %v", pids)
+	}
+}
+
+// worker 寫出回應後立刻結束：回應要讀完才回收行程，不可遺失。
+func TestRapidOCR_ResponseBeforeExitNotLost(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		r, _ := fakeRapidOCR(t, "respond-then-exit")
+		if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+			t.Fatalf("第 %d 次：得到 %q %v", i+1, got, err)
+		}
+		r.Close()
+	}
+	for i := 0; i < 3; i++ {
+		r, _ := fakeRapidOCR(t, "big-respond-then-exit")
+		got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White))
+		if err != nil || len([]rune(got)) != 300_000 {
+			t.Fatalf("大回應第 %d 次：得到 %d 字 %v", i+1, len([]rune(got)), err)
+		}
+		r.Close()
+	}
+}
+
+// 孫行程佔住 stdout 時，逾時殺掉 worker 也不會卡住。
+func TestRapidOCR_GrandchildHoldingStdoutDoesNotHang(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "grandchild-hang")
+	r.Timeout = 300 * time.Millisecond
+	t.Cleanup(func() {
+		for _, l := range workerLog(t, logPath, "grandchild ") {
+			var pid int
+			fmt.Sscanf(l, "grandchild %d", &pid)
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	start := time.Now()
+	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err == nil {
+		t.Error("逾時應回錯誤")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("應在逾時加上 worker 回收寬限內返回，花了 %v", d)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 1 || processAlive(pids[0]) {
+		t.Errorf("worker 應已被殺掉回收，pids %v", pids)
+	}
 }

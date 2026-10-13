@@ -161,8 +161,14 @@ func TestEncodePNG_RoundTrip(t *testing.T) {
 // pngWithDeclaredSize 回傳 1x1 PNG，但 IHDR 宣告的尺寸改為 w x h（並修正 CRC）。
 func pngWithDeclaredSize(t *testing.T, w, h uint32) []byte {
 	t.Helper()
+	return pngOfWithDeclaredSize(t, solid(1, 1, color.RGBA{A: 255}), w, h)
+}
+
+// pngOfWithDeclaredSize 把 src（1x1）編碼成 PNG，再把 IHDR 宣告的尺寸改為 w x h（並修正 CRC）。
+func pngOfWithDeclaredSize(t *testing.T, src image.Image, w, h uint32) []byte {
+	t.Helper()
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, solid(1, 1, color.RGBA{A: 255})); err != nil {
+	if err := png.Encode(&buf, src); err != nil {
 		t.Fatal(err)
 	}
 	data := buf.Bytes()
@@ -209,6 +215,80 @@ func TestCheckImageSize(t *testing.T) {
 		}
 		if !c.ok && !errors.Is(err, ErrImageTooLarge) {
 			t.Errorf("%dx%d 應回 ErrImageTooLarge，得到 %v", c.w, c.h, err)
+		}
+	}
+}
+
+// highDepthImages 回傳 1x1 的 16-bit 圖片：PNG 解碼後分別為 *image.Gray16、*image.RGBA64、*image.NRGBA64。
+func highDepthImages() map[string]image.Image {
+	opaque := image.NewRGBA64(image.Rect(0, 0, 1, 1))
+	opaque.Set(0, 0, color.RGBA64{R: 0xffff, A: 0xffff})
+	translucent := image.NewNRGBA64(image.Rect(0, 0, 1, 1))
+	translucent.Set(0, 0, color.NRGBA64{R: 0xffff, A: 0x8000})
+	return map[string]image.Image{
+		"Gray16":  image.NewGray16(image.Rect(0, 0, 1, 1)),
+		"RGBA64":  opaque,
+		"NRGBA64": translucent,
+	}
+}
+
+// 高色深（16-bit）圖片像素上限減半為 8M：解碼前就以 DecodeConfig 的 ColorModel 拒絕。
+func TestDecodeFirstFrame_HighBitDepthLimitBeforeDecode(t *testing.T) {
+	for name, src := range highDepthImages() {
+		data := pngOfWithDeclaredSize(t, src, 3000, 3000) // 9M 像素：一般圖片允許，16-bit 不允許
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := DecodeFirstFrame(data)
+		runtime.ReadMemStats(&after)
+		if !errors.Is(err, ErrImageTooLarge) {
+			t.Errorf("%s 3000x3000：應回 ErrImageTooLarge，得到 %v", name, err)
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d > 8<<20 {
+			t.Errorf("%s：不應解碼像素，卻分配了 %d bytes", name, d)
+		}
+	}
+}
+
+func TestDecodeFirstFrame_HighBitDepthSmallImageDecodes(t *testing.T) {
+	for name, src := range highDepthImages() {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, src); err != nil {
+			t.Fatal(err)
+		}
+		img, err := DecodeFirstFrame(buf.Bytes())
+		if err != nil {
+			t.Errorf("%s：小圖應可解碼，得到 %v", name, err)
+			continue
+		}
+		if !isHighDepth(img.ColorModel()) {
+			t.Errorf("%s：解碼結果 %T 應為高色深", name, img)
+		}
+	}
+}
+
+func TestCheckImageConfig(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		model color.Model
+		w, h  int
+		ok    bool
+	}{
+		{"16-bit 剛好 8M", color.Gray16Model, 4000, 2000, true},
+		{"16-bit 超過 8M", color.Gray16Model, 4000, 2001, false},
+		{"RGBA64 超過 8M", color.RGBA64Model, 3000, 3000, false},
+		{"NRGBA64 超過 8M", color.NRGBA64Model, 3000, 3000, false},
+		{"16-bit 長邊超過 10000", color.NRGBA64Model, 10001, 1, false},
+		{"8-bit 剛好 16M", color.NRGBAModel, 4000, 4000, true},
+		{"8-bit 超過 16M", color.RGBAModel, 4000, 4001, false},
+		{"YCbCr（JPEG）9M", color.YCbCrModel, 3000, 3000, true},
+		{"Gray 9M", color.GrayModel, 3000, 3000, true},
+	} {
+		err := checkImageConfig(image.Config{ColorModel: c.model, Width: c.w, Height: c.h})
+		if c.ok && err != nil {
+			t.Errorf("%s：應允許，得到 %v", c.name, err)
+		}
+		if !c.ok && !errors.Is(err, ErrImageTooLarge) {
+			t.Errorf("%s：應回 ErrImageTooLarge，得到 %v", c.name, err)
 		}
 	}
 }

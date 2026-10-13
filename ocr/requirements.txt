@@ -1,4 +1,15 @@
-# OCR worker（ocr_worker.py）的 Python 依賴。間接依賴的精確版本待 Pi 上 pip freeze 結果再固定（Q53）。
-rapidocr_onnxruntime==1.4.4
-opencv-python<5
-opencc-python-reimplemented
+# OCR worker（ocr_worker.py）的 Python 依賴，全部鎖定為 Raspberry Pi 3B 上實測的版本（pip freeze）。
+flatbuffers==25.12.19
+numpy==2.5.4
+onnxruntime==1.31.0
+opencc-python-reimplemented==0.1.7
+opencv-python==4.14.0.94
+packaging==26.3
+pillow==12.3.0
+protobuf==7.36.2
+pyclipper==1.4.0
+PyYAML==6.0.3
+rapidocr-onnxruntime==1.4.4
+shapely==2.2.0
+six==1.17.0
+tqdm==4.70.1

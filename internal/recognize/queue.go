@@ -45,6 +45,15 @@ func (s *serializedText) RecognizeText(ctx context.Context, img image.Image) (st
 	return s.t.RecognizeText(ctx, img)
 }
 
+// recognizeWithFallback 佔用一個名額執行整個 RecognizeWithFallback（整張重試接續處理、不重新排隊）。
+func (s *serializedText) recognizeWithFallback(ctx context.Context, subtitle, whole image.Image) (string, error) {
+	if err := s.sem.acquire(ctx); err != nil {
+		return "", err
+	}
+	defer s.sem.release()
+	return RecognizeWithFallback(ctx, s.t, subtitle, whole)
+}
+
 type priorityKey struct{}
 
 // WithPriority 標記 ctx 為優先請求（「重新辨識」使用，Q62）：排隊時先於一般請求放行。

@@ -7,6 +7,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"slices"
+	"sync"
 	"testing"
 )
 
@@ -202,6 +204,42 @@ func TestJoinOCRItems(t *testing.T) {
 			rectItem("橫書", 0, 300, 100, 20),
 			rectItem("直右", 200, 100, 30, 100),
 		}, "橫書\n直右\n直左"},
+		{"直書：同一對話框相鄰兩欄接成一行（不加空白）", []OCRItem{
+			rectItem("左欄", 100, 10, 30, 80),
+			rectItem("右欄", 140, 0, 30, 100),
+		}, "右欄左欄"},
+		{"直書：同一對話框三欄依序接成一行", []OCRItem{
+			rectItem("三", 120, 0, 30, 60),
+			rectItem("一", 200, 0, 30, 100),
+			rectItem("二", 160, 20, 30, 100),
+		}, "一二三"},
+		{"直書：欄間距剛好等於欄寬仍是同一對話框", []OCRItem{
+			rectItem("左", 100, 0, 30, 100),
+			rectItem("右", 160, 0, 30, 100), // 間距 30 = 欄寬
+		}, "右左"},
+		{"直書：欄間距大於欄寬是不同對話框", []OCRItem{
+			rectItem("左", 100, 0, 30, 100),
+			rectItem("右", 161, 0, 30, 100), // 間距 31 > 欄寬
+		}, "右\n左"},
+		{"直書：水平相鄰但垂直範圍不重疊是不同對話框", []OCRItem{
+			rectItem("左下", 100, 150, 30, 100),
+			rectItem("右上", 140, 0, 30, 100),
+		}, "右上\n左下"},
+		{"直書：兩個對話框各兩欄，對話框由右至左", []OCRItem{
+			rectItem("乙二", 160, 0, 30, 100),
+			rectItem("甲一", 400, 0, 30, 100),
+			rectItem("乙一", 200, 0, 30, 100),
+			rectItem("甲二", 360, 0, 30, 100),
+		}, "甲一甲二\n乙一乙二"},
+		{"直書：另一對話框的欄夾在中間也不會拆散", []OCRItem{
+			rectItem("甲二", 250, 0, 30, 100),
+			rectItem("乙", 275, 200, 30, 100), // 水平位置在甲一、甲二之間，但垂直不重疊
+			rectItem("甲一", 300, 0, 30, 100),
+		}, "甲一甲二\n乙"},
+		{"零寬高的框不算直書", []OCRItem{
+			{Box: [4][2]float64{{50, 10}, {50, 10}, {50, 10}, {50, 10}}, Text: "點"},
+			rectItem("左", 0, 0, 40, 20),
+		}, "左點"},
 		{"頂點順序不同也能取得範圍", []OCRItem{
 			{Box: [4][2]float64{{200, 52}, {100, 52}, {100, 22}, {200, 22}}, Text: "下"},
 			{Box: [4][2]float64{{100, 20}, {0, 20}, {0, 0}, {100, 0}}, Text: "上"},
@@ -282,5 +320,145 @@ func TestRecognizeWithFallback_CanceledBeforeRetry(t *testing.T) {
 	_, err := RecognizeWithFallback(ctx, s, solid(64, 12, color.White), solid(128, 72, color.White))
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("ctx 已取消時不應重試，應回 ctx 錯誤，得到 %v", err)
+	}
+}
+
+func TestRecognizeWithFallback_TallImageUsesWholeOnly(t *testing.T) {
+	// 圖片高 > 寬（whole 與原圖同比例）：直接辨識整張，不先讀字幕區。
+	s := &scriptedText{results: []textResult{{text: "整張"}}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(72, 128, color.White))
+	if err != nil || got != "整張" {
+		t.Fatalf("得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 1 || s.sizes[0] != (image.Point{72, 128}) {
+		t.Errorf("直的圖應只辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestRecognizeWithFallback_SquareImageTriesSubtitleFirst(t *testing.T) {
+	s := &scriptedText{results: []textResult{{text: "字幕"}}}
+	if got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(100, 100, color.White)); err != nil || got != "字幕" {
+		t.Fatalf("得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 1 || s.sizes[0] != (image.Point{64, 12}) {
+		t.Errorf("正方形圖應先辨識字幕區，得到 %v", s.sizes)
+	}
+}
+
+// scriptedItems 是能回傳文字框的辨識器（如 RapidOCR）：依序回傳 results，記錄每次收到的圖片尺寸。
+type scriptedItems struct {
+	results [][]OCRItem
+	sizes   []image.Point
+}
+
+func (s *scriptedItems) RecognizeItems(ctx context.Context, img image.Image) ([]OCRItem, error) {
+	s.sizes = append(s.sizes, img.Bounds().Size())
+	r := s.results[0]
+	s.results = s.results[1:]
+	return r, nil
+}
+
+func (s *scriptedItems) RecognizeText(ctx context.Context, img image.Image) (string, error) {
+	items, err := s.RecognizeItems(ctx, img)
+	if err != nil {
+		return "", err
+	}
+	if text := JoinOCRItems(items); text != "" {
+		return text, nil
+	}
+	return "", ErrNoText
+}
+
+func TestRecognizeWithFallback_HorizontalSubtitleKept(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 0, 60, 20)}}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White))
+	if err != nil || got != "字幕" {
+		t.Fatalf("得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 1 {
+		t.Errorf("字幕區只有橫書框時不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestRecognizeWithFallback_VerticalBoxInSubtitleUsesWhole(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{
+		{rectItem("字幕", 0, 0, 60, 20), rectItem("直", 100, 0, 20, 30)}, // 高/寬 = 1.5
+		{rectItem("整張", 0, 0, 60, 20)},
+	}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White))
+	if err != nil || got != "整張" {
+		t.Fatalf("字幕區有直書框應改用整張的結果，得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 2 || s.sizes[1] != (image.Point{128, 72}) {
+		t.Errorf("第二次應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestRecognizeWithFallback_ZeroSizeBoxIsNotVertical(t *testing.T) {
+	point := OCRItem{Box: [4][2]float64{{3, 3}, {3, 3}, {3, 3}, {3, 3}}, Text: "點"}
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 0, 60, 20), point}}}
+	if _, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White)); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.sizes) != 1 {
+		t.Errorf("零寬高的框不算直書，不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestRecognizeWithFallback_NoItemsInSubtitleUsesWhole(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{nil, {rectItem("整張", 0, 0, 60, 20)}}}
+	if got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White)); err != nil || got != "整張" {
+		t.Fatalf("得到 %q %v", got, err)
+	}
+}
+
+// gatedText 第一次呼叫時通知 entered 並等 release；記錄每次呼叫收到的圖片寬度。
+type gatedText struct {
+	mu      sync.Mutex
+	widths  []int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedText) RecognizeText(ctx context.Context, img image.Image) (string, error) {
+	g.mu.Lock()
+	g.widths = append(g.widths, img.Bounds().Dx())
+	first := len(g.widths) == 1
+	g.mu.Unlock()
+	if first {
+		close(g.entered)
+		<-g.release
+		return "", ErrNoText
+	}
+	return "ok", nil
+}
+
+// 整張重試接續處理、不重新排隊：字幕區沒字後，即使有優先請求在排隊，整張也緊接著辨識。
+func TestRecognizeWithFallback_SerializedRetryDoesNotRequeue(t *testing.T) {
+	g := &gatedText{entered: make(chan struct{}), release: make(chan struct{})}
+	q := SerializeText(g)
+	done := make(chan struct{}, 2)
+	go func() {
+		RecognizeWithFallback(context.Background(), q, solid(10, 5, color.White), solid(20, 10, color.White))
+		done <- struct{}{}
+	}()
+	<-g.entered
+	go func() {
+		q.RecognizeText(WithPriority(context.Background()), solid(30, 10, color.White))
+		done <- struct{}{}
+	}()
+	sem := q.(*serializedText).sem
+	waitFor(t, "優先請求排隊", func() bool {
+		sem.mu.Lock()
+		defer sem.mu.Unlock()
+		return len(sem.queues[0]) == 1
+	})
+	close(g.release)
+	<-done
+	<-done
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if want := []int{10, 20, 30}; !slices.Equal(g.widths, want) {
+		t.Errorf("辨識順序（寬度）%v，預期 %v（整張緊接字幕區）", g.widths, want)
 	}
 }
