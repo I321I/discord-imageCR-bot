@@ -116,3 +116,76 @@ func TestOnChannelDelete_RemovesSourceChannel(t *testing.T) {
 		t.Errorf("應寫回儲存頻道，得到 %d 次寫入", len(f.Sent))
 	}
 }
+
+// newLoadedStore 回傳已載入、含指定來源頻道的 store。
+func newLoadedStore(t *testing.T, guildID string, channelIDs ...string) (*discordtest.Fake, *store.Store) {
+	t.Helper()
+	f := discordtest.NewFake()
+	st := store.New(f, "storage")
+	st.UseEmpty()
+	if err := st.Update(context.Background(), func(d *store.Data) error {
+		for _, id := range channelIDs {
+			d.AddChannel(guildID, id, "1")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return f, st
+}
+
+type recordHooks struct {
+	commands.NopIndexHooks
+	removed []string
+}
+
+func (h *recordHooks) ChannelRemoved(channelID string) { h.removed = append(h.removed, channelID) }
+
+func TestOnGuildDelete_RemovedGuildClearsSources(t *testing.T) {
+	_, st := newLoadedStore(t, "g", "c1", "c2")
+	hooks := &recordHooks{}
+	onGuildDelete(st, hooks)(nil, &discordgo.GuildDelete{Guild: &discordgo.Guild{ID: "g"}})
+	if n := len(st.Snapshot().Channels("g")); n != 0 {
+		t.Errorf("bot 離開伺服器後應移除所有來源頻道，剩 %d 個", n)
+	}
+	if len(hooks.removed) != 2 {
+		t.Errorf("應對每個被移除的頻道呼叫 ChannelRemoved：%v", hooks.removed)
+	}
+}
+
+func TestOnGuildDelete_UnavailableKeepsSources(t *testing.T) {
+	f, st := newLoadedStore(t, "g", "c1")
+	sent := len(f.Sent)
+	hooks := &recordHooks{}
+	onGuildDelete(st, hooks)(nil, &discordgo.GuildDelete{Guild: &discordgo.Guild{ID: "g", Unavailable: true}})
+	if _, _, ok := st.Snapshot().SourceChannel("c1"); !ok || len(f.Sent) != sent || len(hooks.removed) != 0 {
+		t.Error("伺服器暫時無法使用時不應移除來源頻道")
+	}
+	onGuildDelete(st, hooks)(nil, &discordgo.GuildDelete{})
+}
+
+func TestOnGuildCreate_PrunesMissingChannels(t *testing.T) {
+	_, st := newLoadedStore(t, "g", "c1", "gone")
+	hooks := &recordHooks{}
+	onGuildCreate(st, hooks)(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}}}})
+	d := st.Snapshot()
+	if _, _, ok := d.SourceChannel("gone"); ok {
+		t.Error("已不存在的來源頻道應被移除")
+	}
+	if _, _, ok := d.SourceChannel("c1"); !ok {
+		t.Error("仍存在的來源頻道不應被移除")
+	}
+	if len(hooks.removed) != 1 || hooks.removed[0] != "gone" {
+		t.Errorf("應呼叫 ChannelRemoved(gone)：%v", hooks.removed)
+	}
+}
+
+func TestOnGuildCreate_UnavailableDoesNothing(t *testing.T) {
+	f, st := newLoadedStore(t, "g", "c1")
+	sent := len(f.Sent)
+	onGuildCreate(st, &recordHooks{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Unavailable: true}})
+	onGuildCreate(st, &recordHooks{})(nil, &discordgo.GuildCreate{})
+	if _, _, ok := st.Snapshot().SourceChannel("c1"); !ok || len(f.Sent) != sent {
+		t.Error("伺服器無法使用（事件中沒有頻道資料）時不應移除來源頻道")
+	}
+}

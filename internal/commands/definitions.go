@@ -47,7 +47,6 @@ func Definitions() (global []*discordgo.ApplicationCommand, devGuild []*discordg
 				sub("add", "設定頻道為圖片存取處之一"),
 				sub("remove", "移除頻道自圖片存取處"),
 				sub("list", "列出此伺服器為圖片存取處的頻道"),
-				sub("id", "顯示此頻道ID"),
 			},
 		},
 		{

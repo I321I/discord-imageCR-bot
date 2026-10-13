@@ -34,14 +34,10 @@ func main() {
 	// 需要 Guilds（gateway state 中的伺服器與頻道）、Guild Messages 與 Message Content；不開 Server Members。
 	sess.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 
-	err = sess.Open()
-	if err != nil {
-		log.Fatalf("連線 Discord 失敗：%v", err)
-	}
-	defer sess.Close()
-
 	ctx := context.Background()
 
+	// 連線前先查開發者、載入設定並註冊 handler，避免連線後到這些步驟完成前的 interaction 與事件
+	// （包含啟動時的 GUILD_CREATE）被漏掉或在設定載入前處理。
 	var devIDs []string
 	app, err := sess.Application("@me")
 	if err != nil {
@@ -53,14 +49,23 @@ func main() {
 	st := store.New(sess, cfg.StorageChannelID)
 	loadStore(ctx, st)
 
+	hooks := commands.NopIndexHooks{}
 	router := &commands.Router{
 		Commands: map[string]commands.Handler{
-			commands.CmdChannel: commands.NewChannelHandler(st, sess.State, sess, commands.NopIndexHooks{}),
+			commands.CmdChannel: commands.NewChannelHandler(st, sess.State, sess, hooks),
 			commands.CmdStorage: commands.NewDevHandler(st, devIDs, cfg.StorageChannelID, sess),
 		},
 	}
 	sess.AddHandler(router.Handle)
-	sess.AddHandler(onChannelDelete(st, commands.NopIndexHooks{}))
+	sess.AddHandler(onChannelDelete(st, hooks))
+	sess.AddHandler(onGuildDelete(st, hooks))
+	sess.AddHandler(onGuildCreate(st, hooks))
+
+	err = sess.Open()
+	if err != nil {
+		log.Fatalf("連線 Discord 失敗：%v", err)
+	}
+	defer sess.Close()
 
 	// 啟動時用 bulk overwrite 同步指令；關機時不刪除（全域指令重新傳播需要時間）。
 	registerCommands(sess, sess.State.User.ID, cfg.DevGuildID)
@@ -89,6 +94,28 @@ func onChannelDelete(st *store.Store, hooks commands.IndexHooks) func(*discordgo
 			return
 		}
 		commands.ChannelDeleted(context.Background(), st, hooks, e.GuildID, e.ID)
+	}
+}
+
+// onGuildDelete 回傳 bot 離開伺服器事件的 handler：被踢出或伺服器被刪除時移除該伺服器所有來源頻道並寫回。
+// 伺服器暫時無法使用（Unavailable）時不動。
+func onGuildDelete(st *store.Store, hooks commands.IndexHooks) func(*discordgo.Session, *discordgo.GuildDelete) {
+	return func(_ *discordgo.Session, e *discordgo.GuildDelete) {
+		if e.Guild == nil || e.Unavailable {
+			return
+		}
+		commands.GuildRemoved(context.Background(), st, hooks, e.ID)
+	}
+}
+
+// onGuildCreate 回傳 GUILD_CREATE 事件（含啟動時）的 handler：移除設定中已不存在的來源頻道並寫回。
+// 伺服器無法使用（Unavailable，事件中沒有頻道資料）時不動。
+func onGuildCreate(st *store.Store, hooks commands.IndexHooks) func(*discordgo.Session, *discordgo.GuildCreate) {
+	return func(_ *discordgo.Session, e *discordgo.GuildCreate) {
+		if e.Guild == nil || e.Unavailable {
+			return
+		}
+		commands.PruneMissingChannels(context.Background(), st, hooks, e.ID, e.Channels)
 	}
 }
 

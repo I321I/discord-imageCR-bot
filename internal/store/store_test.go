@@ -288,3 +288,35 @@ func TestSnapshot_NotBlockedByWrite(t *testing.T) {
 		}
 	}
 }
+
+func TestReload_AppliedWhenNoConcurrentWrite(t *testing.T) {
+	f := discordtest.NewFake()
+	s := New(f, storageCh)
+	applied, err := s.Reload(context.Background())
+	if err != nil || !applied {
+		t.Errorf("沒有並行寫入時應套用讀到的資料：applied=%v err=%v", applied, err)
+	}
+}
+
+func TestReload_NotAppliedWhenWriteDuringLoad(t *testing.T) {
+	base := discordtest.NewFake()
+	ctx := context.Background()
+	api := &blockingList{Fake: base, started: make(chan struct{}), release: make(chan struct{})}
+	s := New(api, storageCh)
+	s.UseEmpty()
+	type result struct {
+		applied bool
+		err     error
+	}
+	done := make(chan result)
+	go func() { a, err := s.Reload(ctx); done <- result{a, err} }()
+	<-api.started
+	if err := s.Update(ctx, func(d *Data) error { d.AddChannel("g", "b", "2"); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	close(api.release)
+	r := <-done
+	if r.err != nil || r.applied {
+		t.Errorf("讀取期間有寫入時應回報未套用：applied=%v err=%v", r.applied, r.err)
+	}
+}

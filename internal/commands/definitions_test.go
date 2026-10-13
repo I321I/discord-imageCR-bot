@@ -45,7 +45,7 @@ func TestDefinitions(t *testing.T) {
 	if ch.DefaultMemberPermissions == nil || *ch.DefaultMemberPermissions != discordgo.PermissionManageGuild {
 		t.Errorf("channel 預設應需要管理伺服器權限")
 	}
-	if !slices.Equal(subNames(ch), []string{"add", "remove", "list", "id"}) {
+	if !slices.Equal(subNames(ch), []string{"add", "remove", "list"}) {
 		t.Errorf("channel 子指令不符：%v", subNames(ch))
 	}
 	if ch.Options[0].Description != "設定頻道為圖片存取處之一" {

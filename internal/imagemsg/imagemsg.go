@@ -86,48 +86,71 @@ func (f Fields) Failed() []Field {
 }
 
 // Format 產生圖片訊息內容：非空欄位依固定順序在前、空欄位在後，最後一行為上傳者。
-// 單行欄位（作品、角色、關鍵字）中的換行會轉成「、」（與 NormalizeList 一致，連續換行與前後換行不留空值）。
-// 超過 2000 字時從最長的欄位開始截（長度相同時依固定順序），不夠再截次長的，被截處結尾加「…」。
+// 單行欄位（作品、角色、關鍵字）含換行時，以換行拆開、修剪前後空白、去除空段與重複後以「、」連接
+// （與 NormalizeList 一致，但只以換行分隔）。
+// 超過 2000 字時平均截：先把最長的欄位截到與次長一樣長，不夠再一起截，直到不超過上限；
+// 被截的欄位截完等長（含結尾的「…」），最短只剩「…」。
 func Format(f Fields, uploaderID string) string {
 	for _, field := range []Field{FieldWork, FieldCharacters, FieldKeywords} {
 		f.Set(field, joinLines(f.Get(field)))
 	}
 	out := format(f, uploaderID)
-	order := slices.Clone(allFields)
-	slices.SortStableFunc(order, func(a, b Field) int {
-		return utf8.RuneCountInString(f.Get(b)) - utf8.RuneCountInString(f.Get(a))
-	})
-	for _, field := range order {
-		excess := utf8.RuneCountInString(out) - MaxLen
-		if excess <= 0 {
-			break
-		}
-		f.Set(field, truncate(f.Get(field), excess))
-		out = format(f, uploaderID)
+	excess := utf8.RuneCountInString(out) - MaxLen
+	if excess <= 0 {
+		return out
 	}
-	return out
+	limit := truncateLimit(f, excess)
+	for _, field := range allFields {
+		if utf8.RuneCountInString(f.Get(field)) > limit {
+			f.Set(field, truncate(f.Get(field), limit))
+		}
+	}
+	return format(f, uploaderID)
 }
 
-// joinLines 把換行拆開、去掉空行後以「、」連接；沒有換行時原樣回傳。
+// truncateLimit 回傳欄位長度上限 L：把所有超過 L 的欄位截成 L 字後，總共至少少 excess 字。
+// 取滿足條件的最大 L（至少 1）。
+func truncateLimit(f Fields, excess int) int {
+	lens := make([]int, 0, len(allFields))
+	for _, field := range allFields {
+		lens = append(lens, utf8.RuneCountInString(f.Get(field)))
+	}
+	saved := func(limit int) int {
+		n := 0
+		for _, l := range lens {
+			if l > limit {
+				n += l - limit
+			}
+		}
+		return n
+	}
+	limit := slices.Max(lens)
+	for limit > 1 && saved(limit) < excess {
+		limit--
+	}
+	return limit
+}
+
+// joinLines 以換行拆開，修剪前後空白、去除空段與重複後以「、」連接；沒有換行時原樣回傳。
 func joinLines(s string) string {
 	if !strings.ContainsAny(s, "\r\n") {
 		return s
 	}
-	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\r' })
-	return strings.Join(parts, "、")
+	var out []string
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		part = strings.TrimSpace(part)
+		if part == "" || slices.Contains(out, part) {
+			continue
+		}
+		out = append(out, part)
+	}
+	return strings.Join(out, "、")
 }
 
-// truncate 讓 s 少 excess 個字（含結尾的「…」）；不夠截時只剩「…」。空字串不變。
-func truncate(s string, excess int) string {
+// truncate 把 s 截成 limit 字（含結尾的「…」，limit 至少為 1）。
+func truncate(s string, limit int) string {
 	r := []rune(s)
-	if len(r) == 0 {
-		return s
-	}
-	keep := len(r) - excess - 1
-	if keep < 0 {
-		keep = 0
-	}
-	return string(r[:keep]) + "…"
+	return string(r[:limit-1]) + "…"
 }
 
 func format(f Fields, uploaderID string) string {

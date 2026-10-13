@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"discordbot/internal/discordtest"
@@ -121,6 +122,39 @@ func TestDev_Reload(t *testing.T) {
 	}
 	if got := lastEdit(t, e.fake); got != "已重新讀取儲存頻道" {
 		t.Errorf("回覆 %q", got)
+	}
+}
+
+// writeDuringList 在第一次讀取儲存頻道時先執行 during（模擬讀取期間有其他寫入完成）。
+type writeDuringList struct {
+	*discordtest.Fake
+	during func()
+	once   sync.Once
+}
+
+func (w *writeDuringList) ChannelMessages(ch string, limit int, before, after, around string, o ...discordgo.RequestOption) ([]*discordgo.Message, error) {
+	msgs, err := w.Fake.ChannelMessages(ch, limit, before, after, around, o...)
+	w.once.Do(w.during)
+	return msgs, err
+}
+
+func TestDev_ReloadSkippedWhenWriteDuringLoad(t *testing.T) {
+	f := discordtest.NewFake()
+	api := &writeDuringList{Fake: f}
+	st := store.New(api, "storage")
+	st.UseEmpty()
+	api.during = func() {
+		if err := st.Update(context.Background(), func(d *store.Data) error { d.AddChannel("g", "b", "2"); return nil }); err != nil {
+			t.Error(err)
+		}
+	}
+	h := NewDevHandler(st, []string{"dev"}, "storage", f)
+	h(context.Background(), devInteraction("dev", "reload", true))
+	if got, want := lastEdit(t, f), msgReloadSuperseded; got != want {
+		t.Errorf("回覆 %q，預期 %q", got, want)
+	}
+	if _, _, ok := st.Snapshot().SourceChannel("b"); !ok {
+		t.Error("應保留讀取期間寫入的最新設定")
 	}
 }
 

@@ -181,20 +181,32 @@ func TestFormat_Max2000(t *testing.T) {
 		t.Errorf("截斷結果不符：%+v %v", f, ok)
 	}
 
-	// 從最長的欄位開始截：作品最長時先截作品，截到只剩「…」仍超過才截次長的角色；圖片文字較短不動。
+	// 平均截：作品最長時先截到與次長的角色一樣長，不夠再兩個一起截；兩者截完等長，較短的圖片文字不動。
 	out = Format(Fields{Work: strings.Repeat("作", 2500), Text: strings.Repeat("字", 100), Characters: strings.Repeat("角", 1990)}, "123")
+	if n := utf8.RuneCountInString(out); n > 2000 || n < 1999 {
+		t.Errorf("長度應為 1999～2000，得到 %d", n)
+	}
+	f, _, ok = Parse(out)
+	if !ok || !strings.HasSuffix(f.Work, "…") || !strings.HasSuffix(f.Characters, "…") || f.Text != strings.Repeat("字", 100) ||
+		utf8.RuneCountInString(f.Work) != utf8.RuneCountInString(f.Characters) {
+		t.Errorf("截斷結果不符：work 長 %d text 長 %d chars 長 %d ok=%v", utf8.RuneCountInString(f.Work), utf8.RuneCountInString(f.Text), utf8.RuneCountInString(f.Characters), ok)
+	}
+
+	// 最長的截到與次長一樣長仍不夠時，兩個一起截成等長。
+	out = Format(Fields{Work: strings.Repeat("作", 1500), Text: strings.Repeat("字", 1000)}, "123")
+	f, _, ok = Parse(out)
+	if !ok || !strings.HasSuffix(f.Text, "…") || !strings.HasSuffix(f.Work, "…") ||
+		utf8.RuneCountInString(f.Work) != utf8.RuneCountInString(f.Text) {
+		t.Errorf("作品與圖片文字應一起截成等長：work 長 %d text 長 %d ok=%v", utf8.RuneCountInString(f.Work), utf8.RuneCountInString(f.Text), ok)
+	}
+
+	// 最長的截到比次長長即可時，只截最長的，次長不動。
+	out = Format(Fields{Work: strings.Repeat("作", 1900), Text: strings.Repeat("字", 500)}, "123")
 	if n := utf8.RuneCountInString(out); n != 2000 {
 		t.Errorf("長度應為 2000，得到 %d", n)
 	}
 	f, _, ok = Parse(out)
-	if !ok || f.Work != "…" || !strings.HasSuffix(f.Characters, "…") || f.Text != strings.Repeat("字", 100) {
-		t.Errorf("截斷結果不符：work=%q text 長 %d chars 長 %d ok=%v", f.Work, utf8.RuneCountInString(f.Text), utf8.RuneCountInString(f.Characters), ok)
-	}
-
-	// 只需截一個欄位時，只截最長的那個。
-	out = Format(Fields{Work: strings.Repeat("作", 1500), Text: strings.Repeat("字", 1000)}, "123")
-	f, _, ok = Parse(out)
-	if !ok || f.Text != strings.Repeat("字", 1000) || !strings.HasSuffix(f.Work, "…") {
+	if !ok || f.Text != strings.Repeat("字", 500) || !strings.HasSuffix(f.Work, "…") {
 		t.Errorf("應只截最長的作品：work 長 %d text 長 %d ok=%v", utf8.RuneCountInString(f.Work), utf8.RuneCountInString(f.Text), ok)
 	}
 

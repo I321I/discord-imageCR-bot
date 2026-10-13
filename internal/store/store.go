@@ -52,6 +52,12 @@ func (s *Store) ChannelID() string { return s.channelID }
 // 讀取期間不持有鎖；若讀取期間有其他寫入完成（Update、Save 等），讀到的可能是較舊的版本，
 // 此時捨棄讀到的資料、保留目前資料（目前資料就是儲存頻道中最新寫入的版本）。
 func (s *Store) Load(ctx context.Context) error {
+	_, err := s.Reload(ctx)
+	return err
+}
+
+// Reload 同 Load，另外回報讀到的資料是否被套用；讀取期間有其他寫入完成而捨棄讀到的資料時 applied=false。
+func (s *Store) Reload(ctx context.Context) (applied bool, err error) {
 	s.writeMu.Lock()
 	gen := s.generation
 	s.writeMu.Unlock()
@@ -62,7 +68,7 @@ func (s *Store) Load(ctx context.Context) error {
 	for {
 		page, err := s.api.ChannelMessages(s.channelID, pageSize, before, "", "", discordgo.WithContext(ctx))
 		if err != nil {
-			return err
+			return false, err
 		}
 		msgs = append(msgs, page...)
 		d, err = DecodeLatest(msgs)
@@ -70,14 +76,14 @@ func (s *Store) Load(ctx context.Context) error {
 			break
 		}
 		if !errors.Is(err, ErrNoData) && !errors.Is(err, ErrNoCompleteVersion) {
-			return err
+			return false, err
 		}
 		if len(page) < pageSize {
 			if errors.Is(err, ErrNoData) {
 				d = NewData()
 				break
 			}
-			return err
+			return false, err
 		}
 		before = page[len(page)-1].ID
 	}
@@ -85,10 +91,10 @@ func (s *Store) Load(ctx context.Context) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if s.generation != gen {
-		return nil
+		return false, nil
 	}
 	s.replace(d)
-	return nil
+	return true, nil
 }
 
 // replace 替換目前資料並設為已載入。呼叫者必須持有 writeMu。
@@ -143,6 +149,8 @@ func (s *Store) save(ctx context.Context, d *Data) error {
 
 // Update 修改資料的複本並寫入儲存頻道，成功後才替換目前資料；fn 或寫入失敗時記憶體中的資料不變。
 // 多個 Update 依序進行。
+//
+// fn 執行期間持有 writeMu（不可重入），fn 內不可呼叫 Update、Save、Load、Reload、UseEmpty，否則會死鎖。
 func (s *Store) Update(ctx context.Context, fn func(d *Data) error) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()

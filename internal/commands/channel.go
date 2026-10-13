@@ -95,8 +95,6 @@ func (h *channelHandler) handle(ctx context.Context, i *discordgo.InteractionCre
 		h.remove(ctx, i)
 	case "list":
 		h.list(i)
-	case "id":
-		h.reply(i, fmt.Sprintf("頻道ID：%v", i.ChannelID))
 	}
 }
 
@@ -159,34 +157,24 @@ func (h *channelHandler) list(i *discordgo.InteractionCreate) {
 
 // replyWithList 以 format 包住目前伺服器的頻道列表回覆；suffix 接在最後。
 func (h *channelHandler) replyWithList(i *discordgo.InteractionCreate, format, suffix string) {
-	content, err := h.channelList(i.GuildID)
-	if err != nil {
-		h.reply(i, err.Error())
-		return
-	}
-	h.reply(i, fmt.Sprintf(format, content)+suffix)
+	h.reply(i, fmt.Sprintf(format, h.channelList(i.GuildID))+suffix)
 }
 
 // editWithList 同 replyWithList，但以 edit 補上 deferred 回應的內容。
 func (h *channelHandler) editWithList(i *discordgo.InteractionCreate, format, suffix string) {
-	content, err := h.channelList(i.GuildID)
-	if err != nil {
-		h.edit(i, err.Error())
-		return
-	}
-	h.edit(i, fmt.Sprintf(format, content)+suffix)
+	h.edit(i, fmt.Sprintf(format, h.channelList(i.GuildID))+suffix)
 }
 
 // channelList 回傳 "伺服器：X\n[a、b]\n"；沒有頻道時回空字串。
-// state 查不到的頻道（例如 bot 離線時被刪除）顯示頻道 ID。
-func (h *channelHandler) channelList(guildID string) (string, error) {
-	guild, err := h.state.Guild(guildID)
-	if err != nil {
-		return "", err
-	}
+// state 查不到的伺服器顯示伺服器 ID、查不到的頻道（例如 bot 離線時被刪除）顯示頻道 ID。
+func (h *channelHandler) channelList(guildID string) string {
 	ids := h.st.Snapshot().Channels(guildID)
 	if len(ids) == 0 {
-		return "", nil
+		return ""
+	}
+	guildName := guildID
+	if guild, err := h.state.Guild(guildID); err == nil {
+		guildName = guild.Name
 	}
 	names := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -197,7 +185,7 @@ func (h *channelHandler) channelList(guildID string) (string, error) {
 		}
 		names = append(names, ch.Name)
 	}
-	return fmt.Sprintf("伺服器：%v\n[%v]\n", guild.Name, strings.Join(names, "、")), nil
+	return fmt.Sprintf("伺服器：%v\n[%v]\n", guildName, strings.Join(names, "、"))
 }
 
 func missingPermissionsWarning(perms int64) string {
@@ -242,6 +230,52 @@ func ChannelDeleted(ctx context.Context, st *store.Store, hooks IndexHooks, guil
 	}
 	log.Printf("來源頻道 %s 已被刪除，已從設定移除", channelID)
 	hooks.ChannelRemoved(channelID)
+}
+
+// GuildRemoved 處理 bot 離開伺服器（被踢出或伺服器被刪除）：移除該伺服器所有來源頻道並寫回，
+// 成功後對每個被移除的頻道通知索引。沒有來源頻道時不寫入；寫入失敗只記 log。
+func GuildRemoved(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string) {
+	removeGuildChannels(ctx, st, hooks, guildID, func(string) bool { return true }, "bot 已離開伺服器")
+}
+
+// PruneMissingChannels 比對伺服器實際存在的頻道（GUILD_CREATE 事件中的頻道），
+// 移除設定中已不存在的來源頻道並寫回，成功後對每個被移除的頻道通知索引。沒有變動時不寫入；寫入失敗只記 log。
+func PruneMissingChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, existing []*discordgo.Channel) {
+	exists := make(map[string]bool, len(existing))
+	for _, ch := range existing {
+		if ch != nil {
+			exists[ch.ID] = true
+		}
+	}
+	removeGuildChannels(ctx, st, hooks, guildID, func(id string) bool { return !exists[id] }, "頻道已不存在")
+}
+
+// removeGuildChannels 移除伺服器中 shouldRemove 為 true 的來源頻道並寫回；reason 用於 log。
+func removeGuildChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, shouldRemove func(channelID string) bool, reason string) {
+	var removed []string
+	err := st.Update(ctx, func(d *store.Data) error {
+		removed = nil
+		for _, id := range d.Channels(guildID) {
+			if shouldRemove(id) && d.RemoveChannel(guildID, id) {
+				removed = append(removed, id)
+			}
+		}
+		if len(removed) == 0 {
+			return errNotListed
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errNotListed):
+		return
+	case err != nil:
+		log.Printf("伺服器 %s 的來源頻道 %v（%s）移除時寫入儲存頻道失敗：%v", guildID, removed, reason, err)
+		return
+	}
+	log.Printf("伺服器 %s 的來源頻道 %v（%s）已從設定移除", guildID, removed, reason)
+	for _, id := range removed {
+		hooks.ChannelRemoved(id)
+	}
 }
 
 // deferEphemeral 送出 ephemeral 的 deferred 回應；失敗時記 log 並回 false。

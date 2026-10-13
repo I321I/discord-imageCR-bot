@@ -405,11 +405,11 @@ func TestChannelList_Empty(t *testing.T) {
 	}
 }
 
-func TestChannelId(t *testing.T) {
+func TestChannelId_Removed(t *testing.T) {
 	e := newChannelEnv(t)
 	e.run(channelInteraction("g1", "c1", "id"))
-	if got := lastReply(t, e.fake); got != "頻道ID：c1" {
-		t.Errorf("回覆 %q", got)
+	if len(e.fake.Responses) != 0 {
+		t.Errorf("/channel id 已移除，不應回應：%+v", e.fake.Responses)
 	}
 }
 
@@ -430,5 +430,24 @@ func TestChannelAdd_DeferFailsSkipsAdd(t *testing.T) {
 	}
 	if len(e.fake.ResponseEdits) != 0 || len(e.fake.Sent) != 0 {
 		t.Error("deferred 回應失敗時不應寫入或補上內容")
+	}
+}
+
+func TestChannelList_GuildMissingFromStateShowsGuildID(t *testing.T) {
+	e := newChannelEnv(t)
+	e.addMissingChannel(t, "g9", "x", "1")
+	e.run(channelInteraction("g9", "x", "list"))
+	if got, want := lastReply(t, e.fake), "頻道列表：\n伺服器：g9\n[x]\n"; got != want {
+		t.Errorf("回覆 %q，預期 %q", got, want)
+	}
+}
+
+func TestChannelRemove_GuildMissingFromStateListsWithGuildID(t *testing.T) {
+	e := newChannelEnv(t)
+	e.addMissingChannel(t, "g9", "x", "1")
+	e.addMissingChannel(t, "g9", "y", "2")
+	e.run(channelInteraction("g9", "x", "remove"))
+	if got, want := lastEdit(t, e.fake), "移除此頻道自頻道列表，目前頻道列表：\n伺服器：g9\n[y]\n"; got != want {
+		t.Errorf("回覆 %q，預期 %q", got, want)
 	}
 }

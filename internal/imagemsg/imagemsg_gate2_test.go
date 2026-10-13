@@ -25,7 +25,7 @@ func TestGate2_TruncateLongestFirstOnly(t *testing.T) {
 	}
 }
 
-// 兩個最長欄位等長且需要截兩個欄位時，結果仍 ≤ 2000 且可解析。
+// 四個欄位等長且都要截時：平均截成等長，結果仍 ≤ 2000 且可解析。
 func TestGate2_TruncateMultipleFields(t *testing.T) {
 	f := Fields{Work: strings.Repeat("a", 1500), Text: strings.Repeat("b", 1500), Characters: strings.Repeat("c", 1500), Keywords: strings.Repeat("d", 1500)}
 	out := Format(f, "123")
@@ -36,17 +36,24 @@ func TestGate2_TruncateMultipleFields(t *testing.T) {
 	if !ok {
 		t.Fatal("無法解析")
 	}
-	t.Logf("作品 %d、圖片文字 %d、角色 %d、關鍵字 %d", utf8.RuneCountInString(g.Work), utf8.RuneCountInString(g.Text), utf8.RuneCountInString(g.Characters), utf8.RuneCountInString(g.Keywords))
+	w, x, c, k := utf8.RuneCountInString(g.Work), utf8.RuneCountInString(g.Text), utf8.RuneCountInString(g.Characters), utf8.RuneCountInString(g.Keywords)
+	if w != x || x != c || c != k {
+		t.Errorf("四欄應截成等長：作品 %d、圖片文字 %d、角色 %d、關鍵字 %d", w, x, c, k)
+	}
+	if n := utf8.RuneCountInString(out); n < MaxLen-3 {
+		t.Errorf("長度 %d，平均截後不應比上限少超過 3 字", n)
+	}
 }
 
-// 單行欄位的 \r\n、只有換行、空白行的處理（實作者選擇不修剪、不去重）。
+// 單行欄位的 \r\n、只有換行、空白行的處理：與 NormalizeList 一致（修剪、去除空段與重複）。
 func TestGate2_SingleLineJoinEdgeCases(t *testing.T) {
 	cases := map[string]string{
-		"a\r\nb":  "a、b",
-		"\n\n":    "",
-		"\na\n":   "a",
-		"a\n \nb": "a、 、b", // 不修剪：空白行保留成「 」
-		"a\na":    "a、a",   // 不去重
+		"a\r\nb":   "a、b",
+		"\n\n":     "",
+		"\na\n":    "a",
+		"a\n \nb":  "a、b", // 空白行去除
+		"a\na":     "a",   // 去重
+		" a \n b ": "a、b", // 修剪
 	}
 	for in, want := range cases {
 		out := Format(Fields{Work: in, Text: "t"}, "1")

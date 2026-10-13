@@ -11,7 +11,10 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-const msgDevOnly = "只有開發者可以使用此指令"
+const (
+	msgDevOnly          = "只有開發者可以使用此指令"
+	msgReloadSuperseded = "讀取期間有新的寫入，已保留最新設定（未套用這次讀到的資料）"
+)
 
 // DeveloperIDs 回傳 application 的開發者：有 Team 時為已接受邀請的團隊成員，否則為擁有者。
 func DeveloperIDs(app *discordgo.Application) []string {
@@ -64,9 +67,14 @@ func NewDevHandler(st *store.Store, devIDs []string, storageChannelID string, ap
 			if !deferEphemeral(api, i) {
 				return
 			}
-			if err := st.Load(ctx); err != nil {
+			applied, err := st.Reload(ctx)
+			if err != nil {
 				log.Printf("開發者重新讀取儲存頻道失敗：%v", err)
 				editResponse(api, i, "重新讀取失敗："+err.Error())
+				return
+			}
+			if !applied {
+				editResponse(api, i, msgReloadSuperseded)
 				return
 			}
 			editResponse(api, i, "已重新讀取儲存頻道")
