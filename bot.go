@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"discordbot/internal/commands"
 	"discordbot/internal/config"
@@ -59,7 +60,7 @@ func main() {
 	sess.AddHandler(router.Handle)
 	sess.AddHandler(onChannelDelete(st, hooks))
 	sess.AddHandler(onGuildDelete(st, hooks))
-	sess.AddHandler(onGuildCreate(st, hooks))
+	sess.AddHandler(onGuildCreate(st, hooks, sess.State))
 
 	err = sess.Open()
 	if err != nil {
@@ -108,14 +109,37 @@ func onGuildDelete(st *store.Store, hooks commands.IndexHooks) func(*discordgo.S
 	}
 }
 
+// stateRLocker 是 gateway state 的讀鎖，*discordgo.State 直接滿足。
+type stateRLocker interface {
+	RLock()
+	RUnlock()
+}
+
 // onGuildCreate 回傳 GUILD_CREATE 事件（含啟動時）的 handler：移除設定中已不存在的來源頻道並寫回。
-// 伺服器無法使用（Unavailable，事件中沒有頻道資料）時不動。
-func onGuildCreate(st *store.Store, hooks commands.IndexHooks) func(*discordgo.Session, *discordgo.GuildCreate) {
+// 伺服器無法使用（Unavailable，事件中沒有頻道資料）或頻道清單為空時不動。
+// 事件中的 Guild 與 state 共用，state 會在鎖內原地改寫頻道陣列，所以要在 state 讀鎖下複製頻道 ID。
+// 只清除收到事件之前設定的來源頻道（見 commands.PruneMissingChannels）。
+// 已知限制：receivedAt 是本機時鐘，setAt 是 Discord 的 snowflake 時間，兩者有時鐘誤差。
+// 本機時鐘比 Discord 快時，事件之後才設定、但 snowflake 時間仍早於 receivedAt 的頻道可能被誤刪；
+// 比 Discord 慢時，事件之前就設定的已刪除頻道可能這次不清除（下次 GUILD_CREATE 再清）。
+func onGuildCreate(st *store.Store, hooks commands.IndexHooks, state stateRLocker) func(*discordgo.Session, *discordgo.GuildCreate) {
 	return func(_ *discordgo.Session, e *discordgo.GuildCreate) {
+		receivedAt := time.Now()
 		if e.Guild == nil || e.Unavailable {
 			return
 		}
-		commands.PruneMissingChannels(context.Background(), st, hooks, e.ID, e.Channels)
+		state.RLock()
+		ids := make([]string, 0, len(e.Channels))
+		for _, ch := range e.Channels {
+			if ch != nil {
+				ids = append(ids, ch.ID)
+			}
+		}
+		state.RUnlock()
+		if len(ids) == 0 {
+			return
+		}
+		commands.PruneMissingChannels(context.Background(), st, hooks, e.ID, ids, receivedAt)
 	}
 }
 

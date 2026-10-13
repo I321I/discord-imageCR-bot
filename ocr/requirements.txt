@@ -1,0 +1,4 @@
+# OCR worker（ocr_worker.py）的 Python 依賴。間接依賴的精確版本待 Pi 上 pip freeze 結果再固定（Q53）。
+rapidocr_onnxruntime==1.4.4
+opencv-python<5
+opencc-python-reimplemented

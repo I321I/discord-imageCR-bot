@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"discordbot/internal/store"
 
@@ -25,6 +26,7 @@ type StateReader interface {
 }
 
 // IndexHooks 在來源頻道新增/移除成功後被呼叫。
+// 呼叫端來自不同的 Discord 事件 goroutine，實作必須可並行呼叫（自行上鎖）。
 type IndexHooks interface {
 	ChannelAdded(guildID, channelID string)
 	ChannelRemoved(channelID string)
@@ -235,28 +237,35 @@ func ChannelDeleted(ctx context.Context, st *store.Store, hooks IndexHooks, guil
 // GuildRemoved 處理 bot 離開伺服器（被踢出或伺服器被刪除）：移除該伺服器所有來源頻道並寫回，
 // 成功後對每個被移除的頻道通知索引。沒有來源頻道時不寫入；寫入失敗只記 log。
 func GuildRemoved(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string) {
-	removeGuildChannels(ctx, st, hooks, guildID, func(string) bool { return true }, "bot 已離開伺服器")
+	removeGuildChannels(ctx, st, hooks, guildID, func(string, string) bool { return true }, "bot 已離開伺服器")
 }
 
-// PruneMissingChannels 比對伺服器實際存在的頻道（GUILD_CREATE 事件中的頻道），
+// PruneMissingChannels 比對伺服器實際存在的頻道（GUILD_CREATE 事件中的頻道 ID），
 // 移除設定中已不存在的來源頻道並寫回，成功後對每個被移除的頻道通知索引。沒有變動時不寫入；寫入失敗只記 log。
-func PruneMissingChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, existing []*discordgo.Channel) {
-	exists := make(map[string]bool, len(existing))
-	for _, ch := range existing {
-		if ch != nil {
-			exists[ch.ID] = true
-		}
+// 只移除設定時間點（setAt snowflake）早於 receivedAt（收到 GUILD_CREATE 的時間）的來源頻道，
+// 避免把事件之後才新增的頻道誤刪；setAt 無法解析時無法判斷先後，不移除。
+func PruneMissingChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, existingIDs []string, receivedAt time.Time) {
+	exists := make(map[string]bool, len(existingIDs))
+	for _, id := range existingIDs {
+		exists[id] = true
 	}
-	removeGuildChannels(ctx, st, hooks, guildID, func(id string) bool { return !exists[id] }, "頻道已不存在")
+	shouldRemove := func(id, setAt string) bool {
+		if exists[id] {
+			return false
+		}
+		t, err := discordgo.SnowflakeTimestamp(setAt)
+		return err == nil && t.Before(receivedAt)
+	}
+	removeGuildChannels(ctx, st, hooks, guildID, shouldRemove, "頻道已不存在")
 }
 
 // removeGuildChannels 移除伺服器中 shouldRemove 為 true 的來源頻道並寫回；reason 用於 log。
-func removeGuildChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, shouldRemove func(channelID string) bool, reason string) {
+func removeGuildChannels(ctx context.Context, st *store.Store, hooks IndexHooks, guildID string, shouldRemove func(channelID, setAt string) bool, reason string) {
 	var removed []string
 	err := st.Update(ctx, func(d *store.Data) error {
 		removed = nil
 		for _, id := range d.Channels(guildID) {
-			if shouldRemove(id) && d.RemoveChannel(guildID, id) {
+			if shouldRemove(id, d.Guilds[guildID][id]) && d.RemoveChannel(guildID, id) {
 				removed = append(removed, id)
 			}
 		}

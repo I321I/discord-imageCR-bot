@@ -4,8 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
-
-	"github.com/bwmarrin/discordgo"
+	"time"
 )
 
 // 不同伺服器的 GuildRemoved / PruneMissingChannels 並行執行：不互相影響、無 data race。
@@ -32,11 +31,11 @@ func TestGate3_GuildEventsConcurrent(t *testing.T) {
 	go func() { defer wg.Done(); GuildRemoved(context.Background(), e.st, hooks, "g1") }()
 	go func() {
 		defer wg.Done()
-		PruneMissingChannels(context.Background(), e.st, hooks, "g2", []*discordgo.Channel{{ID: "b1"}})
+		PruneMissingChannels(context.Background(), e.st, hooks, "g2", []string{"b1"}, time.Now())
 	}()
 	go func() {
 		defer wg.Done()
-		PruneMissingChannels(context.Background(), e.st, hooks, "g3", []*discordgo.Channel{{ID: "k1"}})
+		PruneMissingChannels(context.Background(), e.st, hooks, "g3", []string{"k1"}, time.Now())
 	}()
 	wg.Wait()
 	d := e.st.Snapshot()
@@ -48,11 +47,12 @@ func TestGate3_GuildEventsConcurrent(t *testing.T) {
 	}
 }
 
-// 記錄行為：GUILD_CREATE 的 Channels 為空（非 Unavailable）時會清掉該伺服器所有來源頻道。
+// 記錄行為：PruneMissingChannels 收到空清單時會清掉該伺服器所有來源頻道
+// （GUILD_CREATE 頻道清單為空時由 onGuildCreate 跳過，不會呼叫到這裡）。
 func TestGate3_PruneEmptyChannelListRemovesAll(t *testing.T) {
 	e := newChannelEnv(t)
 	addSources(t, e.st, "g1", "c1", "c2")
-	PruneMissingChannels(context.Background(), e.st, e.hooks, "g1", []*discordgo.Channel{})
+	PruneMissingChannels(context.Background(), e.st, e.hooks, "g1", []string{}, time.Now())
 	if n := len(e.st.Snapshot().Channels("g1")); n != 0 {
 		t.Errorf("現行行為應全部移除，剩 %d", n)
 	}

@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"discordbot/internal/commands"
 	"discordbot/internal/discordtest"
@@ -167,7 +170,7 @@ func TestOnGuildDelete_UnavailableKeepsSources(t *testing.T) {
 func TestOnGuildCreate_PrunesMissingChannels(t *testing.T) {
 	_, st := newLoadedStore(t, "g", "c1", "gone")
 	hooks := &recordHooks{}
-	onGuildCreate(st, hooks)(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}}}})
+	onGuildCreate(st, hooks, &sync.RWMutex{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}}}})
 	d := st.Snapshot()
 	if _, _, ok := d.SourceChannel("gone"); ok {
 		t.Error("已不存在的來源頻道應被移除")
@@ -183,9 +186,98 @@ func TestOnGuildCreate_PrunesMissingChannels(t *testing.T) {
 func TestOnGuildCreate_UnavailableDoesNothing(t *testing.T) {
 	f, st := newLoadedStore(t, "g", "c1")
 	sent := len(f.Sent)
-	onGuildCreate(st, &recordHooks{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Unavailable: true}})
-	onGuildCreate(st, &recordHooks{})(nil, &discordgo.GuildCreate{})
+	onGuildCreate(st, &recordHooks{}, &sync.RWMutex{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Unavailable: true}})
+	onGuildCreate(st, &recordHooks{}, &sync.RWMutex{})(nil, &discordgo.GuildCreate{})
 	if _, _, ok := st.Snapshot().SourceChannel("c1"); !ok || len(f.Sent) != sent {
 		t.Error("伺服器無法使用（事件中沒有頻道資料）時不應移除來源頻道")
+	}
+}
+
+// GUILD_CREATE 頻道清單為空（且非 Unavailable）時跳過、不清除。
+func TestOnGuildCreate_EmptyChannelListSkips(t *testing.T) {
+	f, st := newLoadedStore(t, "g", "c1")
+	sent := len(f.Sent)
+	hooks := &recordHooks{}
+	onGuildCreate(st, hooks, &sync.RWMutex{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g"}})
+	onGuildCreate(st, hooks, &sync.RWMutex{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{}}})
+	if _, _, ok := st.Snapshot().SourceChannel("c1"); !ok || len(f.Sent) != sent || len(hooks.removed) != 0 {
+		t.Error("頻道清單為空時不應清除來源頻道")
+	}
+}
+
+// GUILD_CREATE 收到之後才設定的來源頻道不可被清除。
+func TestOnGuildCreate_KeepsChannelSetAfterReceived(t *testing.T) {
+	_, st := newLoadedStore(t, "g", "gone")
+	future := strconv.FormatUint(uint64(time.Now().Add(time.Hour).UnixMilli()-1420070400000)<<22, 10)
+	if err := st.Update(context.Background(), func(d *store.Data) error {
+		d.AddChannel("g", "fresh", future)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	onGuildCreate(st, &recordHooks{}, &sync.RWMutex{})(nil, &discordgo.GuildCreate{Guild: &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}}}})
+	d := st.Snapshot()
+	if _, _, ok := d.SourceChannel("fresh"); !ok {
+		t.Error("收到 GUILD_CREATE 之後才設定的來源頻道不應被清除")
+	}
+	if _, _, ok := d.SourceChannel("gone"); ok {
+		t.Error("之前設定且已不存在的來源頻道應被清除")
+	}
+}
+
+// mutateOnRUnlock 模擬 state 在讀鎖釋放後立刻原地改寫頻道陣列（State.ChannelRemove）。
+type mutateOnRUnlock struct {
+	rlocks int
+	after  func()
+}
+
+func (m *mutateOnRUnlock) RLock() { m.rlocks++ }
+func (m *mutateOnRUnlock) RUnlock() {
+	if m.after != nil {
+		m.after()
+		m.after = nil
+	}
+}
+
+// 頻道 ID 必須在 state 讀鎖下複製：讀鎖釋放後 state 改寫陣列，不應影響這次的比對。
+func TestOnGuildCreate_CopiesChannelIDsUnderStateLock(t *testing.T) {
+	_, st := newLoadedStore(t, "g", "c1", "c2")
+	g := &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}, {ID: "c2"}}}
+	lock := &mutateOnRUnlock{after: func() {
+		// 與 discordgo State.ChannelRemove 相同的原地刪除：移除 c1，c2 移到索引 0，最後一格保留舊值。
+		g.Channels = append(g.Channels[:0], g.Channels[1:]...)
+	}}
+	onGuildCreate(st, &recordHooks{}, lock)(nil, &discordgo.GuildCreate{Guild: g})
+	if lock.rlocks != 1 {
+		t.Errorf("應取得 state 讀鎖一次，得到 %d 次", lock.rlocks)
+	}
+	d := st.Snapshot()
+	for _, id := range []string{"c1", "c2"} {
+		if _, _, ok := d.SourceChannel(id); !ok {
+			t.Errorf("事件當下存在的來源頻道 %s 不應被清除", id)
+		}
+	}
+}
+
+// 與 state 並行改寫頻道陣列（持有寫鎖）時無 data race（以 -race 檢查）。
+func TestOnGuildCreate_ConcurrentStateWriteNoRace(t *testing.T) {
+	_, st := newLoadedStore(t, "g", "c1")
+	state := &sync.RWMutex{}
+	g := &discordgo.Guild{ID: "g", Channels: []*discordgo.Channel{{ID: "c1"}, {ID: "c2"}, {ID: "c3"}}}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		state.Lock()
+		defer state.Unlock()
+		g.Channels = append(g.Channels[:1], g.Channels[2:]...)
+	}()
+	go func() {
+		defer wg.Done()
+		onGuildCreate(st, &recordHooks{}, state)(nil, &discordgo.GuildCreate{Guild: g})
+	}()
+	wg.Wait()
+	if _, _, ok := st.Snapshot().SourceChannel("c1"); !ok {
+		t.Error("c1 一直存在，不應被清除")
 	}
 }
