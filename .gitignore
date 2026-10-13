@@ -5,3 +5,8 @@ slash-commands
 
 # Python
 __pycache__/
+
+# 有版權的真實截圖測試圖片（只留在本機）
+internal/recognize/testdata/sub_*
+internal/recognize/testdata/manga_*
+internal/recognize/testdata/tv_*
