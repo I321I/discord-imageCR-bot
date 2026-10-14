@@ -31,6 +31,7 @@ var errOCRClosed = errors.New("rapidocr closed")
 // RapidOCR 透過常駐的 Python 子行程（ocr/ocr_worker.py，RapidOCR + OpenCC）辨識文字（Q54）。
 // 以 stdin/stdout 一行一個 JSON 溝通；第一張圖才啟動 worker，閒置 IdleTimeout 後結束（Q55）。
 // 同時只送一張；逾時、worker 結束、輸出非 JSON 或 id 不符時殺掉 worker，下一張重新啟動。
+// 送出前發現 worker 已結束（兩張之間意外結束）時直接重新啟動，該張不失敗。
 type RapidOCR struct {
 	Command      []string      // worker 指令，預設 {"python3", "/app/ocr/ocr_worker.py"}
 	StartTimeout time.Duration // 等待 ready 的上限（0 = 不限）
@@ -120,6 +121,12 @@ func (r *RapidOCR) RecognizeItems(ctx context.Context, img image.Image) ([]OCRIt
 		r.mu.Unlock()
 	}()
 
+	if w != nil && !w.alive() {
+		// 兩張之間 worker 意外結束（OOM 被殺等）：重新啟動，不讓這張失敗。
+		log.Printf("OCR worker 已結束，重新啟動")
+		r.discard(w)
+		w = nil
+	}
 	if w == nil {
 		if w, err = r.start(ctx); err != nil {
 			return nil, err
@@ -228,6 +235,12 @@ func (r *RapidOCR) start(ctx context.Context) (*ocrWorker, error) {
 	select {
 	case line, ok := <-w.lines:
 		if !ok {
+			r.mu.Lock()
+			closed := r.closed
+			r.mu.Unlock()
+			if closed {
+				return fail(errOCRClosed)
+			}
 			return fail(errors.New("OCR worker 啟動後意外結束"))
 		}
 		var msg workerMessage
@@ -268,6 +281,16 @@ func (w *ocrWorker) readLines(stdout io.Reader) {
 		if err != nil {
 			return
 		}
+	}
+}
+
+// alive 回傳 worker 行程是否仍在執行（尚未結束並被回收）。
+func (w *ocrWorker) alive() bool {
+	select {
+	case <-w.exited:
+		return false
+	default:
+		return true
 	}
 }
 

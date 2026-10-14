@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -35,6 +36,13 @@ type ResponseEdit struct {
 	Edit        *discordgo.WebhookEdit
 }
 
+// ReactionCall 是一次 MessageReactionAdd（Op "add"）或 MessageReactionRemove（Op "remove"）呼叫。
+type ReactionCall struct {
+	Op                          string
+	ChannelID, MessageID, Emoji string
+	UserID                      string // 只有 remove 有
+}
+
 type Followup struct {
 	Interaction *discordgo.Interaction
 	Params      *discordgo.WebhookParams
@@ -54,6 +62,7 @@ type Fake struct {
 	Responses     []Response
 	ResponseEdits []ResponseEdit
 	Followups     []Followup
+	ReactionCalls []ReactionCall // 成功的反應新增／移除（依呼叫順序）
 	Calls         map[string]int
 
 	messages map[string][]*discordgo.Message // channelID → 訊息（依 ID 由舊到新）
@@ -307,6 +316,46 @@ func (f *Fake) FollowupMessageCreate(interaction *discordgo.Interaction, wait bo
 	}
 	f.Followups = append(f.Followups, Followup{Interaction: interaction, Params: data})
 	return &discordgo.Message{ID: f.newID()}, nil
+}
+
+func (f *Fake) MessageReactionAdd(channelID, messageID, emojiID string, options ...discordgo.RequestOption) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.begin("MessageReactionAdd"); err != nil {
+		return err
+	}
+	f.ReactionCalls = append(f.ReactionCalls, ReactionCall{Op: "add", ChannelID: channelID, MessageID: messageID, Emoji: emojiID})
+	return nil
+}
+
+func (f *Fake) MessageReactionRemove(channelID, messageID, emojiID, userID string, options ...discordgo.RequestOption) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.begin("MessageReactionRemove"); err != nil {
+		return err
+	}
+	f.ReactionCalls = append(f.ReactionCalls, ReactionCall{Op: "remove", ChannelID: channelID, MessageID: messageID, Emoji: emojiID, UserID: userID})
+	return nil
+}
+
+// ReactionsOn 回傳 bot 目前在該訊息上的反應（依新增順序；已移除的不算）。
+func (f *Fake) ReactionsOn(channelID, messageID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.ReactionCalls {
+		if c.ChannelID != channelID || c.MessageID != messageID {
+			continue
+		}
+		i := slices.Index(out, c.Emoji)
+		switch {
+		case c.Op == "add" && i < 0:
+			out = append(out, c.Emoji)
+		case c.Op == "remove" && i >= 0:
+			out = slices.Delete(out, i, i+1)
+		}
+	}
+	return out
 }
 
 // ErrInjected 是測試常用的注入錯誤。

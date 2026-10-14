@@ -1,4 +1,4 @@
-"""把關者補充測試：假名判定邊界、combine_rec 在框數與回傳長度不一致時的行為。
+"""把關者補充測試：假名判定邊界、combine_rec 在中文、日文回傳筆數不一致時全部改用中文。
 
 執行：python3 -m unittest ocr/test_gate_ocr_worker.py（在專案根目錄）
 """
@@ -37,7 +37,7 @@ class GateKanaTest(unittest.TestCase):
 
 
 class GateCombineRecLengthTest(unittest.TestCase):
-    """RapidOCR 1.4.4 的 TextRecognizer 對每張輸入都回一項；此處記錄長度不一致時的實際行為。"""
+    """RapidOCR 1.4.4 的 TextRecognizer 對每張輸入都回一項；萬一中文、日文回傳筆數不一致，全部改用中文結果。"""
 
     def test_japanese_shorter_than_chinese(self):
         def ch_rec(imgs, return_word_box=False):
@@ -47,10 +47,7 @@ class GateCombineRecLengthTest(unittest.TestCase):
             return [("か", 0.9)], 1.0  # 只回一項
 
         res, _ = ocr_worker.combine_rec(ch_rec, jp_rec, lambda s: s)(["a", "b", "c"], False)
-        # 只記錄行為、不鎖定（目前 zip 會截斷，後面的框整個遺失）；若日後改成補中文結果，此測試不需修改。
-        print(f"\n[gate] 3 個框、日文只回 1 項 → combine_rec 回 {len(res)} 項：{res}", file=sys.stderr)
-        self.assertGreaterEqual(len(res), 1)
-
+        self.assertEqual(res, [("中0", 0.9), ("中1", 0.9), ("中2", 0.9)])
 
 if __name__ == "__main__":
     unittest.main()

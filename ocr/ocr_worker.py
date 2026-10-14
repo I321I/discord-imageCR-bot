@@ -9,7 +9,7 @@
   以腳本執行時，協定輸出使用原本 fd 1 的複本，fd 1 改指向 stderr（C 函式庫直接寫 fd 1 的輸出也不會混入協定）。
 
 辨識：偵測只做一次，每個文字框都用中文與日文模型辨識；日文結果含平假名或片假名時採用日文結果，
-否則採用中文結果並簡轉繁（OpenCC）。文字框超過 MAX_DUAL_REC_BOXES 個或找不到日文模型檔時只用中文模型。
+否則採用中文結果並簡轉繁（OpenCC）。文字框超過 MAX_DUAL_REC_BOXES 個、找不到或無法載入日文模型檔時只用中文模型。
 
 rapidocr_onnxruntime、cv2、numpy、opencc 只在 create_engine、create_japanese_rec、create_converter、decode_png 中 import，
 讓單元測試不需安裝它們。
@@ -55,7 +55,8 @@ def combine_rec(ch_rec, jp_rec, convert):
     """回傳取代 RapidOCR engine.text_rec 的辨識函式 rec(img_list, return_word_box) -> (結果, 耗時)。
 
     每個文字框都用中文（ch_rec）與日文（jp_rec）模型辨識：日文結果含假名時採用日文結果，
-    否則採用中文結果並以 convert 簡轉繁。jp_rec 為 None 或文字框超過 MAX_DUAL_REC_BOXES 個時只用中文。
+    否則採用中文結果並以 convert 簡轉繁。jp_rec 為 None 或文字框超過 MAX_DUAL_REC_BOXES 個時只用中文；
+    中文、日文回傳筆數不一致時全部改用中文結果。
     結果每項為 (text, score, ...)，其餘欄位跟著採用的模型。
     """
 
@@ -67,6 +68,9 @@ def combine_rec(ch_rec, jp_rec, convert):
         if jp_rec is None or len(img_list) > MAX_DUAL_REC_BOXES:
             return [chinese(r) for r in r_ch], e_ch
         r_jp, e_jp = jp_rec(img_list, return_word_box)
+        if len(r_jp) != len(r_ch):
+            log(f"中文、日文辨識結果筆數不一致（{len(r_ch)}、{len(r_jp)}），全部改用中文結果")
+            return [chinese(r) for r in r_ch], e_ch + e_jp
         out = [tuple(b) if has_kana(b[0]) else chinese(a) for a, b in zip(r_ch, r_jp)]
         return out, e_ch + e_jp
 
@@ -74,14 +78,18 @@ def combine_rec(ch_rec, jp_rec, convert):
 
 
 def create_japanese_rec():
-    """建立日文辨識模型；模型或字典檔不存在時記錄到 stderr 並回傳 None（只用中文）。"""
+    """建立日文辨識模型；模型或字典檔不存在、或載入失敗時記錄到 stderr 並回傳 None（只用中文）。"""
     missing = [p for p in (JAPAN_REC_MODEL, JAPAN_REC_KEYS) if not os.path.exists(p)]
     if missing:
         log(f"找不到日文模型檔 {', '.join(missing)}，只用中文模型")
         return None
     from rapidocr_onnxruntime.ch_ppocr_rec import TextRecognizer
 
-    return TextRecognizer({**JAPAN_REC_PARAMS, "model_path": JAPAN_REC_MODEL, "rec_keys_path": JAPAN_REC_KEYS})
+    try:
+        return TextRecognizer({**JAPAN_REC_PARAMS, "model_path": JAPAN_REC_MODEL, "rec_keys_path": JAPAN_REC_KEYS})
+    except Exception as e:
+        log(f"載入日文模型失敗：{e}，只用中文模型")
+        return None
 
 
 def create_engine(convert):

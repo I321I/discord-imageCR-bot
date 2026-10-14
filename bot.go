@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -11,6 +12,8 @@ import (
 
 	"discordbot/internal/commands"
 	"discordbot/internal/config"
+	"discordbot/internal/pipeline"
+	"discordbot/internal/recognize"
 	"discordbot/internal/store"
 
 	"github.com/bwmarrin/discordgo"
@@ -35,7 +38,8 @@ func main() {
 	// 需要 Guilds（gateway state 中的伺服器與頻道）、Guild Messages 與 Message Content；不開 Server Members。
 	sess.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsMessageContent
 
-	ctx := context.Background()
+	// 關機時取消：進行中的自動處理不再發出圖片訊息（留給下次啟動補處理）。
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// 連線前先查開發者、載入設定並註冊 handler，避免連線後到這些步驟完成前的 interaction 與事件
 	// （包含啟動時的 GUILD_CREATE）被漏掉或在設定載入前處理。
@@ -62,6 +66,18 @@ func main() {
 	sess.AddHandler(onGuildDelete(st, hooks))
 	sess.AddHandler(onGuildCreate(st, hooks, sess.State))
 
+	// 來源頻道自動處理：trace.moe 與 OCR 各自排隊（並行數 1）。
+	ocr := recognize.NewRapidOCR()
+	p := &pipeline.Pipeline{
+		API:   sess,
+		Fetch: pipeline.NewHTTPFetcher(),
+		Work:  recognize.Serialize(recognize.NewTraceMoe(cfg.TraceMoeKey, cfg.TraceMoeMinSimilarity), 1),
+		Text:  recognize.SerializeText(ocr),
+		Store: st,
+		Index: pipeline.NopIndex{},
+	}
+	sess.AddHandler(onMessageCreate(ctx, p))
+
 	err = sess.Open()
 	if err != nil {
 		log.Fatalf("連線 Discord 失敗：%v", err)
@@ -78,6 +94,30 @@ func main() {
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 	log.Print("關閉機器人")
+	shutdown(cancel, ocr)
+}
+
+// shutdown 先取消 ctx（進行中的處理以錯誤結束、不發出圖片訊息），再結束 OCR worker。
+func shutdown(cancel context.CancelFunc, ocr io.Closer) {
+	cancel()
+	if err := ocr.Close(); err != nil {
+		log.Printf("關閉 OCR worker 失敗：%v", err)
+	}
+}
+
+// messageHandler 處理新訊息（*pipeline.Pipeline 直接滿足）。
+type messageHandler interface {
+	HandleMessage(ctx context.Context, m *discordgo.Message)
+}
+
+// onMessageCreate 回傳新訊息事件的 handler：交給 pipeline 在背景處理（辨識可能需要數十秒）。
+func onMessageCreate(ctx context.Context, h messageHandler) func(*discordgo.Session, *discordgo.MessageCreate) {
+	return func(_ *discordgo.Session, e *discordgo.MessageCreate) {
+		if e.Message == nil {
+			return
+		}
+		go h.HandleMessage(ctx, e.Message)
+	}
 }
 
 // loadStore 讀取儲存頻道；讀取失敗或找不到完整版本時記 log，並以空資料啟動。

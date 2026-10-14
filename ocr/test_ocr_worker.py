@@ -296,6 +296,21 @@ class CreateEngineTest(unittest.TestCase):
         self.assertIn("/nonexistent/japan_dict.txt", self.stderr.getvalue())
 
 
+    def test_japanese_model_load_failure_falls_back_to_chinese(self):
+        model, keys = self.model_files()
+
+        def broken(config):
+            raise RuntimeError("壞掉的模型")
+
+        rec_mod = sys.modules["rapidocr_onnxruntime.ch_ppocr_rec"]
+        with mock.patch.object(ocr_worker, "JAPAN_REC_MODEL", model), mock.patch.object(ocr_worker, "JAPAN_REC_KEYS", keys), \
+                mock.patch.object(rec_mod, "TextRecognizer", broken):
+            engine = ocr_worker.create_engine(lambda s: "繁" + s)
+        self.assertIn("壞掉的模型", self.stderr.getvalue())
+        res, _ = engine.text_rec(["あ"], False)
+        self.assertEqual(res, [("繁中あ", 0.9)])
+
+
 class HasKanaTest(unittest.TestCase):
     def test_has_kana(self):
         for s, want in [
@@ -352,6 +367,11 @@ class CombineRecTest(unittest.TestCase):
         self.assertEqual(res, [("これ", 0.8)])
         res, _ = ocr_worker.combine_rec(ch_rec, None, lambda s: "繁:" + s)(["a"], False)
         self.assertEqual(res, [("繁:这", 0.9)])
+
+    def test_length_mismatch_uses_chinese_for_all(self):
+        rec = self.make(["这", "那", "他"], ["これ"])
+        res, _ = rec(["a", "b", "c"], False)
+        self.assertEqual(res, [("繁:这", 0.9, "ch-word"), ("繁:那", 0.9, "ch-word"), ("繁:他", 0.9, "ch-word")])
 
     def test_over_100_boxes_uses_chinese_only(self):
         rec = self.make(["这"] * 101, ["これ"] * 101)

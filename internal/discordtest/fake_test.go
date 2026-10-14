@@ -114,3 +114,29 @@ func idsOf(ms []*discordgo.Message) []string {
 	}
 	return out
 }
+
+func TestFake_Reactions(t *testing.T) {
+	f := NewFake()
+	if err := f.MessageReactionAdd("c1", "m1", "⏳"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MessageReactionAdd("c1", "m1", "❌"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.MessageReactionRemove("c1", "m1", "⏳", "@me"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.ReactionsOn("c1", "m1"); len(got) != 1 || got[0] != "❌" {
+		t.Errorf("目前反應應只剩 ❌，得到 %q", got)
+	}
+	if len(f.ReactionCalls) != 3 || f.ReactionCalls[2] != (ReactionCall{Op: "remove", ChannelID: "c1", MessageID: "m1", Emoji: "⏳", UserID: "@me"}) {
+		t.Errorf("ReactionCalls 紀錄不符：%+v", f.ReactionCalls)
+	}
+	f.FailOn["MessageReactionAdd"] = ErrInjected
+	if err := f.MessageReactionAdd("c1", "m1", "⏳"); err != ErrInjected {
+		t.Errorf("應回注入的錯誤，得到 %v", err)
+	}
+	if got := f.ReactionsOn("c1", "m1"); len(got) != 1 {
+		t.Errorf("失敗的新增不應改變反應，得到 %q", got)
+	}
+}

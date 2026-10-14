@@ -321,6 +321,37 @@ func TestRapidOCR_WorkerCrashRestarts(t *testing.T) {
 	}
 }
 
+// 兩張之間 worker 意外結束（OOM 被殺等）：送出前發現 worker 已不在，自動重新啟動，該張不失敗。
+func TestRapidOCR_DeadWorkerRestartedBeforeSend(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "echo")
+	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil {
+		t.Fatal(err)
+	}
+	pids := startedPIDs(t, logPath)
+	if len(pids) != 1 {
+		t.Fatalf("應啟動一次，得到 %v", pids)
+	}
+	if err := syscall.Kill(pids[0], syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "worker 被回收", func() bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		select {
+		case <-r.w.exited:
+			return true
+		default:
+			return false
+		}
+	})
+	if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+		t.Errorf("worker 已結束時應自動重新啟動並成功，得到 %q %v", got, err)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 2 {
+		t.Errorf("應重新啟動一次（共兩次），得到 %v", pids)
+	}
+}
+
 func TestRapidOCR_GarbageStdoutIsError(t *testing.T) {
 	r, logPath := fakeRapidOCR(t, "garbage")
 	for i := 0; i < 2; i++ {
@@ -632,8 +663,8 @@ func TestRapidOCR_CloseDuringStartup(t *testing.T) {
 	}
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Error("啟動中被 Close 應回錯誤")
+		if !errors.Is(err, errOCRClosed) {
+			t.Errorf("啟動中被 Close 應回 errOCRClosed，得到 %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close 後啟動中的請求沒有返回")

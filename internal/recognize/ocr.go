@@ -125,7 +125,8 @@ type OCRItem struct {
 // verticalRatio：文字框高/寬 ≥ 此值視為直書（RapidOCR 會把這種框轉 90 度再辨識）。
 const verticalRatio = 1.5
 
-// bubbleGapRatio：兩個直書欄的水平間距 ≤ 較寬欄寬度的此倍數、且垂直範圍有重疊時，視為同一對話框。
+// bubbleGapRatio：兩個直書欄的水平間距 ≤ 較寬欄寬度的此倍數、且垂直範圍有重疊時，視為同一對話框；
+// 同一欄內上下兩框的間距 > 較寬框寬度的此倍數時，視為不同對話框。
 const bubbleGapRatio = 1.0
 
 // span 是文字框在某一軸上的範圍。
@@ -167,7 +168,7 @@ func toBoxes(items []OCRItem) []ocrBox {
 
 // JoinOCRItems 把文字框組成文字：
 // 橫書框依垂直範圍分行（與目前行重疊 ≥ 較矮者 50% 視為同一行），行由上到下、行內由左到右以空白連接；
-// 直書框（高/寬 ≥ 1.5）依水平範圍分欄（規則相同），欄內由上到下；同一對話框的欄（相鄰欄水平間距 ≤ 較寬欄寬度、
+// 直書框（高/寬 ≥ 1.5）依水平範圍分欄（規則相同），欄內由上到下，上下間距 > 較寬框寬度時拆成不同段；同一對話框的欄（相鄰欄水平間距 ≤ 較寬欄寬度、
 // 垂直範圍有重疊）由右至左接成一行（不加空白），不同對話框各一行，依最右欄的位置由右至左排列；
 // 橫書行在前、直書在後；最後套用 CleanOCRText。不依信心度過濾（RapidOCR 內建已過濾，Q66）。
 func JoinOCRItems(items []OCRItem) string {
@@ -185,7 +186,8 @@ func JoinOCRItems(items []OCRItem) string {
 		lines = append(lines, joinTexts(g, " "))
 	}
 	// 直書：依 x 分欄（由右至左），欄內依 y 由上到下；再把同一對話框的欄接成一行。
-	lines = append(lines, joinColumns(groupBoxes(vertical, func(b ocrBox) span { return b.x }, func(b ocrBox) span { return b.y }, true))...)
+	columns := groupBoxes(vertical, func(b ocrBox) span { return b.x }, func(b ocrBox) span { return b.y }, true)
+	lines = append(lines, joinColumns(splitColumns(columns))...)
 	return CleanOCRText(strings.Join(lines, "\n"))
 }
 
@@ -218,6 +220,24 @@ func groupBoxes(boxes []ocrBox, across, along func(ocrBox) span, reverse bool) [
 		sort.SliceStable(g, func(i, j int) bool { return along(g[i]).lo < along(g[j]).lo })
 	}
 	return groups
+}
+
+// splitColumns 把每個直書欄（欄內已由上到下排序）在上下兩框間距 > 較寬框寬度 × bubbleGapRatio 處拆開，
+// 拆開的各段視為不同欄（之後可各自與相鄰欄組成對話框）。順序維持：欄由右至左，同欄各段由上到下。
+func splitColumns(columns [][]ocrBox) [][]ocrBox {
+	var out [][]ocrBox
+	for _, g := range columns {
+		start := 0
+		for i := 1; i < len(g); i++ {
+			gap := g[i].y.lo - g[i-1].y.hi
+			if gap > bubbleGapRatio*max(g[i].x.size(), g[i-1].x.size()) {
+				out = append(out, g[start:i])
+				start = i
+			}
+		}
+		out = append(out, g[start:])
+	}
+	return out
 }
 
 // joinTexts 以 sep 連接各框的文字。

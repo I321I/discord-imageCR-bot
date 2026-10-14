@@ -281,3 +281,67 @@ func TestOnGuildCreate_ConcurrentStateWriteNoRace(t *testing.T) {
 		t.Error("c1 一直存在，不應被清除")
 	}
 }
+
+type recordingHandler struct {
+	got chan *discordgo.Message
+	ctx chan context.Context
+}
+
+func (h *recordingHandler) HandleMessage(ctx context.Context, m *discordgo.Message) {
+	h.ctx <- ctx
+	h.got <- m
+}
+
+func TestOnMessageCreate_HandsMessageToPipeline(t *testing.T) {
+	h := &recordingHandler{got: make(chan *discordgo.Message, 1), ctx: make(chan context.Context, 1)}
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "v")
+	m := &discordgo.Message{ID: "m1", ChannelID: "c"}
+	onMessageCreate(ctx, h)(nil, &discordgo.MessageCreate{Message: m})
+	select {
+	case got := <-h.got:
+		if got != m {
+			t.Errorf("得到 %+v，預期原訊息", got)
+		}
+		if c := <-h.ctx; c.Value(key{}) != "v" {
+			t.Error("應傳入 bot 的 ctx（關機時取消）")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("沒有呼叫 HandleMessage")
+	}
+}
+
+func TestOnMessageCreate_NilMessageIgnored(t *testing.T) {
+	h := &recordingHandler{got: make(chan *discordgo.Message, 1), ctx: make(chan context.Context, 1)}
+	onMessageCreate(context.Background(), h)(nil, &discordgo.MessageCreate{})
+	select {
+	case <-h.got:
+		t.Error("沒有訊息內容時不應呼叫 HandleMessage")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+type ctxCheckingCloser struct {
+	ctx            context.Context
+	closed         bool
+	ctxDoneAtClose bool
+}
+
+func (c *ctxCheckingCloser) Close() error {
+	c.closed = true
+	c.ctxDoneAtClose = c.ctx.Err() != nil
+	return nil
+}
+
+// 關機：先取消 ctx（進行中的處理不再發出圖片），再關閉 OCR worker。
+func TestShutdown_CancelsBeforeClosingOCR(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &ctxCheckingCloser{ctx: ctx}
+	shutdown(cancel, c)
+	if !c.closed {
+		t.Fatal("應關閉 OCR")
+	}
+	if !c.ctxDoneAtClose {
+		t.Error("關閉 OCR 前應先取消 ctx")
+	}
+}
