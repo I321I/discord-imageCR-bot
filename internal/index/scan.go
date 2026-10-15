@@ -1,0 +1,271 @@
+package index
+
+import (
+	"context"
+	"log"
+	"slices"
+	"sync"
+
+	"discordbot/internal/recognize"
+	"discordbot/internal/snowflake"
+	"discordbot/internal/store"
+
+	"github.com/bwmarrin/discordgo"
+)
+
+// API 是掃描需要的 Discord 方法（*discordgo.Session 直接滿足）。
+type API interface {
+	ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string, options ...discordgo.RequestOption) ([]*discordgo.Message, error)
+}
+
+// Backfiller 接收要補處理的原訊息（*pipeline.Pipeline 直接滿足）：只排入佇列，不等待處理完成。
+// 傳入的 ctx 會跟著訊息留在佇列中，輪到時 ctx 已結束就放棄，所以必須是 bot 關機才取消的 ctx。
+type Backfiller interface {
+	EnqueueBackfill(ctx context.Context, guildID string, m *discordgo.Message) <-chan error
+}
+
+const (
+	scanPageSize   = 100
+	reactionFailed = "❌" // 與 pipeline 的失敗標記反應相同
+)
+
+// ScanChannel 由新到舊分頁讀完頻道歷史：
+//   - bot 自己的訊息 → PutImageMessage（不是圖片訊息的會被忽略）；
+//   - 其他 bot、webhook、沒有圖片或含非圖片附件的訊息 → 忽略（Q50）；
+//   - 使用者的帶圖訊息，ID 早於 setAt（snowflake 數值比較）→ 舊圖片訊息（PutLegacy）；
+//   - ID 晚於 setAt：帶有 bot 的 ❌（處理失敗過）→ 不補處理也不收錄（決定 10）；其他 → 讀完後由舊到新交給補處理。
+//
+// 每讀完一頁就寫進索引（掃描期間搜尋回傳已建好的部分，Q52）。ctx 結束時停止並回錯誤，不交給補處理。
+// 交給 bf 時傳入的也是 ctx；ctx 會在掃描結束後取消時，bf 要自行改用不會隨掃描結束而取消的 ctx（見 Hooks）。
+func ScanChannel(ctx context.Context, api API, x *Index, bf Backfiller, botID, guildID, channelID, setAt string) error {
+	var backfill []*discordgo.Message
+	before := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		page, err := api.ChannelMessages(channelID, scanPageSize, before, "", "")
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for _, m := range page {
+			switch {
+			case m.Author == nil:
+			case m.Author.ID == botID:
+				x.PutImageMessage(guildID, m)
+			case m.Author.Bot || m.WebhookID != "" || !recognize.Eligible(m):
+			case snowflake.Less(m.ID, setAt):
+				x.PutLegacy(guildID, m)
+			case hasOwnReaction(m, reactionFailed):
+			default:
+				backfill = append(backfill, m)
+			}
+		}
+		if len(page) < scanPageSize {
+			break
+		}
+		before = page[len(page)-1].ID
+	}
+	slices.SortFunc(backfill, func(a, b *discordgo.Message) int { return snowflake.Compare(a.ID, b.ID) })
+	for _, m := range backfill {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		bf.EnqueueBackfill(ctx, guildID, m)
+	}
+	return nil
+}
+
+// hasOwnReaction 回傳訊息上是否有 bot 自己加的 emoji 反應。
+func hasOwnReaction(m *discordgo.Message, emoji string) bool {
+	for _, r := range m.Reactions {
+		if r != nil && r.Me && r.Emoji != nil && r.Emoji.Name == emoji {
+			return true
+		}
+	}
+	return false
+}
+
+// Hooks 讓索引跟著來源頻道設定與訊息事件更新：滿足 commands.IndexHooks（頻道新增時掃描、移除時清除），
+// 並處理訊息刪除與編輯（Q31）；也是 pipeline 的 IndexSink（頻道移除後不再寫入）。
+type Hooks struct {
+	ctx   context.Context // 關機時取消：停止掃描
+	api   API
+	x     *Index
+	bf    Backfiller
+	store *store.Store
+
+	mu    sync.Mutex
+	botID string
+	scans map[string]*scan // channelID → 進行中的掃描
+	wg    sync.WaitGroup
+
+	// putMu 讓「確認仍是來源頻道再寫入」與 ChannelRemoved 的清除互斥：
+	// 設定先移除頻道才呼叫 ChannelRemoved，所以寫入要嘛在清除之前（會被清掉），要嘛看得到頻道已移除。
+	putMu sync.Mutex
+}
+
+// shutdownBackfiller 把補處理排入佇列時改用 bot 關機 ctx：掃描用的 ctx 在掃描結束時就會取消，
+// 若沿用它，佇列輪到時會當成關機而放棄。頻道移除後的放棄由佇列輪到時的來源頻道檢查負責。
+type shutdownBackfiller struct {
+	ctx context.Context
+	bf  Backfiller
+}
+
+func (b shutdownBackfiller) EnqueueBackfill(_ context.Context, guildID string, m *discordgo.Message) <-chan error {
+	return b.bf.EnqueueBackfill(b.ctx, guildID, m)
+}
+
+type scan struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func NewHooks(ctx context.Context, api API, x *Index, bf Backfiller, st *store.Store) *Hooks {
+	return &Hooks{ctx: ctx, api: api, x: x, bf: bf, store: st, scans: map[string]*scan{}}
+}
+
+// SetBotID 設定 bot 自己的使用者 ID（連線後才知道）。
+func (h *Hooks) SetBotID(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.botID = id
+}
+
+func (h *Hooks) getBotID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.botID
+}
+
+// ChannelAdded 在背景掃描新設定的來源頻道（setAt 取自設定）。
+func (h *Hooks) ChannelAdded(guildID, channelID string) {
+	_, setAt, ok := h.store.Snapshot().SourceChannel(channelID)
+	if !ok {
+		return
+	}
+	h.startScan(guildID, channelID, setAt)
+}
+
+// ChannelRemoved 停止該頻道進行中的掃描並等它結束，再清除該頻道的索引。
+func (h *Hooks) ChannelRemoved(channelID string) {
+	h.stopScan(channelID)
+	h.putMu.Lock()
+	defer h.putMu.Unlock()
+	h.x.RemoveChannel(channelID)
+}
+
+// PutImageMessage 收錄 pipeline 發出的圖片訊息；該頻道已不是來源頻道時不寫入。
+func (h *Hooks) PutImageMessage(guildID string, m *discordgo.Message) {
+	if m == nil {
+		return
+	}
+	h.putMu.Lock()
+	defer h.putMu.Unlock()
+	if _, _, ok := h.store.Snapshot().SourceChannel(m.ChannelID); !ok {
+		return
+	}
+	h.x.PutImageMessage(guildID, m)
+}
+
+// ScanAll 掃描 d 中所有來源頻道（各頻道各一個 goroutine），全部結束才返回；錯誤記 log。
+func (h *Hooks) ScanAll(d *store.Data) {
+	var dones []chan struct{}
+	for guildID, chs := range d.Guilds {
+		for channelID, setAt := range chs {
+			dones = append(dones, h.startScan(guildID, channelID, setAt))
+		}
+	}
+	for _, done := range dones {
+		<-done
+	}
+}
+
+// Wait 等待所有進行中的掃描結束。
+func (h *Hooks) Wait() { h.wg.Wait() }
+
+// startScan 開始掃描 channelID，回傳掃描結束時關閉的 channel。
+// 登記新掃描與取出舊掃描在同一把鎖內完成，並發呼叫時舊的一定會被取消；新掃描等舊的結束才開始。
+func (h *Hooks) startScan(guildID, channelID, setAt string) chan struct{} {
+	ctx, cancel := context.WithCancel(h.ctx)
+	s := &scan{cancel: cancel, done: make(chan struct{})}
+	h.mu.Lock()
+	old := h.scans[channelID]
+	h.scans[channelID] = s
+	botID := h.botID
+	h.wg.Add(1)
+	h.mu.Unlock()
+	bf := shutdownBackfiller{ctx: h.ctx, bf: h.bf}
+	go func() {
+		defer h.wg.Done()
+		defer close(s.done)
+		defer cancel()
+		if old != nil {
+			old.cancel()
+			<-old.done
+		}
+		if err := ScanChannel(ctx, h.api, h.x, bf, botID, guildID, channelID, setAt); err != nil && ctx.Err() == nil {
+			log.Printf("掃描頻道 %s 失敗：%v", channelID, err)
+		}
+		h.mu.Lock()
+		if h.scans[channelID] == s {
+			delete(h.scans, channelID)
+		}
+		h.mu.Unlock()
+	}()
+	return s.done
+}
+
+// stopScan 取消 channelID 進行中的掃描並等待結束。
+func (h *Hooks) stopScan(channelID string) {
+	h.mu.Lock()
+	s := h.scans[channelID]
+	delete(h.scans, channelID)
+	h.mu.Unlock()
+	if s != nil {
+		s.cancel()
+		<-s.done
+	}
+}
+
+// MessageDeleted 移除被刪除訊息的索引項目。
+func (h *Hooks) MessageDeleted(channelID, messageID string) {
+	h.x.RemoveMessage(channelID, messageID)
+}
+
+// MessagesDeleted 移除批次刪除的訊息的索引項目。
+func (h *Hooks) MessagesDeleted(channelID string, messageIDs []string) {
+	for _, id := range messageIDs {
+		h.x.RemoveMessage(channelID, id)
+	}
+}
+
+// MessageUpdated 依編輯後的訊息更新索引：來源頻道中 bot 的圖片訊息重新收錄；
+// 設定時間點之前的使用者帶圖訊息（舊圖片訊息）重新收錄，沒有文字或不再是圖片訊息則移除。
+// 其他訊息（含設定時間點之後、等待處理或處理失敗的原訊息）不動；
+// 使用者訊息的更新沒有附件資訊（Attachments 為 nil）時也不動，附件確定被清空（空陣列）才移除。
+func (h *Hooks) MessageUpdated(m *discordgo.Message) {
+	if m == nil || m.Author == nil {
+		return
+	}
+	guildID, setAt, ok := h.store.Snapshot().SourceChannel(m.ChannelID)
+	if !ok {
+		return
+	}
+	botID := h.getBotID()
+	switch {
+	case botID != "" && m.Author.ID == botID:
+		h.x.PutImageMessage(guildID, m)
+	case m.Author.Bot || m.WebhookID != "":
+	case m.Attachments == nil:
+		// 沒有附件資訊（部分更新）：無法判斷附件是否被移除，保守不動。
+	case snowflake.Less(m.ID, setAt):
+		h.x.RemoveMessage(m.ChannelID, m.ID)
+		if recognize.Eligible(m) {
+			h.x.PutLegacy(guildID, m)
+		}
+	}
+}

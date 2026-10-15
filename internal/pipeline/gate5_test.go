@@ -163,6 +163,10 @@ func TestGate5_MentionsInContentDoNotNotify(t *testing.T) {
 	if am == nil || len(am.Parse) != 0 || len(am.Users) != 0 || len(am.Roles) != 0 || am.RepliedUser {
 		t.Errorf("allowed_mentions 應存在且不允許任何通知：%s", b)
 	}
+	// 使用者決定 6：與 Discord 文件一致，明確送出 "parse":[]。
+	if !strings.Contains(string(b), `"allowed_mentions":{"parse":[]`) {
+		t.Errorf("allowed_mentions 應序列化為 \"parse\":[]：%s", b)
+	}
 }
 
 // 把關：不同伺服器的來源頻道，索引收到的伺服器 ID 各自正確（不混用）。

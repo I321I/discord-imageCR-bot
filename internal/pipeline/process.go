@@ -34,22 +34,14 @@ func (p *Pipeline) HandleMessage(ctx context.Context, m *discordgo.Message) {
 	}
 }
 
-// Process 處理一則來源頻道的圖片訊息：
-// 下載全部附件（超過 25MB 不下載）→ 逐張辨識（全部完成）→ 每張發一則圖片訊息（重新上傳原檔，
-// 上傳者 mention 不通知，原訊息文字放進關鍵字）→ 每則成功就加入索引 → 全部發完才刪除原訊息。
+// Process 把一則來源頻道的圖片訊息排入佇列（見 Enqueue）並等待處理完成：
+// 下載全部附件（超過 25MB 不下載；長度與 Size 不符視為下載失敗）→ 逐張辨識（全部完成）→
+// 每張發一則圖片訊息（重新上傳原檔，mention 一律不通知，原訊息文字放進關鍵字）→
+// 每則成功就加入索引 → 全部發完才刪除原訊息。
 // 任何下載失敗都不發出任何圖片訊息；任何失敗都不刪除原訊息，並在原訊息加 ❌（Q24、Q25）。
 // ctx 結束（bot 關機）時不發出、不刪除、不加 ❌，留給下次啟動補處理。
 func (p *Pipeline) Process(ctx context.Context, guildID string, m *discordgo.Message) error {
-	p.react(m, reactionProcessing)
-	err := p.process(ctx, guildID, m)
-	if err == nil {
-		return nil
-	}
-	p.unreact(m, reactionProcessing)
-	if ctx.Err() == nil {
-		p.react(m, reactionFailed)
-	}
-	return err
+	return <-p.Enqueue(ctx, guildID, m)
 }
 
 func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Message) error {
@@ -61,6 +53,9 @@ func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Mes
 		data, err := p.Fetch.Fetch(ctx, a.URL)
 		if err != nil {
 			return fmt.Errorf("下載附件 %s 失敗：%w", a.Filename, err)
+		}
+		if len(data) != a.Size {
+			return fmt.Errorf("下載附件 %s 失敗：%w（預期 %d bytes，得到 %d）", a.Filename, ErrSizeMismatch, a.Size, len(data))
 		}
 		files[i] = data
 	}
@@ -81,7 +76,7 @@ func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Mes
 		sent, err := p.API.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
 			Content:         contents[i],
 			Files:           []*discordgo.File{{Name: a.Filename, ContentType: a.ContentType, Reader: bytes.NewReader(files[i])}},
-			AllowedMentions: &discordgo.MessageAllowedMentions{}, // Q20：只顯示 mention，不通知
+			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}}, // Q20、決定 6：只顯示 mention，不通知
 		})
 		if err != nil {
 			sendErrs = append(sendErrs, fmt.Errorf("發送第 %d 張（%s）失敗：%w", i+1, a.Filename, err))

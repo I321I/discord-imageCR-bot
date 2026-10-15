@@ -164,7 +164,7 @@ func TestProcess_TwoImages(t *testing.T) {
 			t.Errorf("第 %d 則附件 bytes 與原檔不同", i+1)
 		}
 		// Q20：上傳者 mention 不通知。
-		if am := s.Data.AllowedMentions; am == nil || len(am.Parse) != 0 || len(am.Users) != 0 || len(am.Roles) != 0 || am.RepliedUser {
+		if am := s.Data.AllowedMentions; am == nil || am.Parse == nil || len(am.Parse) != 0 || len(am.Users) != 0 || len(am.Roles) != 0 || am.RepliedUser {
 			t.Errorf("第 %d 則 AllowedMentions 應不允許任何通知：%+v", i+1, am)
 		}
 	}
@@ -320,10 +320,31 @@ func TestProcess_AttachmentTooLarge(t *testing.T) {
 	}
 }
 
-// 剛好 25MB 仍處理。
+// 下載到的 bytes 長度與附件 Size 不符（下載不完整）：視為下載失敗，不發、不刪、加 ❌。
+func TestProcess_DownloadSizeMismatch(t *testing.T) {
+	e := newEnv(t)
+	m := e.imageMessage(t, "a.png", "b.png")
+	url := m.Attachments[1].URL
+	e.fetch.data[url] = e.fetch.data[url][:len(e.fetch.data[url])-1]
+	if err := e.p.Process(context.Background(), testGuild, m); err == nil {
+		t.Error("大小不符時 Process 應回錯誤")
+	}
+	if len(e.fake.Sent) != 0 || !e.originalExists(m) {
+		t.Errorf("大小不符時不發不刪：Sent %d", len(e.fake.Sent))
+	}
+	if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) {
+		t.Errorf("原訊息反應應只剩 ❌，得到 %q", got)
+	}
+}
+
+// 剛好 25MB 仍處理（PNG 後面補到 25MiB，解碼器忽略 IEND 之後的資料）。
 func TestProcess_AttachmentExactly25MB(t *testing.T) {
 	e := newEnv(t)
 	m := e.imageMessage(t, "a.png")
+	url := m.Attachments[0].URL
+	padded := make([]byte, MaxAttachmentSize)
+	copy(padded, e.fetch.data[url])
+	e.fetch.data[url] = padded
 	m.Attachments[0].Size = MaxAttachmentSize
 	if err := e.p.Process(context.Background(), testGuild, m); err != nil {
 		t.Fatal(err)

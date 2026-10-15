@@ -15,6 +15,9 @@ const MaxAttachmentSize = 25 << 20
 // ErrTooLarge 表示附件超過 MaxAttachmentSize。
 var ErrTooLarge = errors.New("attachment too large")
 
+// ErrSizeMismatch 表示下載到的長度與附件的 Size 不符（下載不完整），視為下載失敗。
+var ErrSizeMismatch = errors.New("downloaded size does not match attachment size")
+
 // HTTPFetcher 以 HTTP GET 下載附件；內容超過 MaxBytes 時回 ErrTooLarge。
 type HTTPFetcher struct {
 	Client   *http.Client

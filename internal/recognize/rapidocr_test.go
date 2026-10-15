@@ -68,6 +68,12 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(time.Hour)
 		case mode == "crash-first-start" && firstStart:
 			os.Exit(3)
+		case mode == "crash-always":
+			os.Exit(3)
+		case mode == "close-stdout-first-start" && firstStart:
+			// 收到請求後關閉 stdout（Go 端讀到 EOF）但行程仍在，模擬尚未回應就 EOF。
+			os.Stdout.Close()
+			time.Sleep(time.Hour)
 		case mode == "garbage":
 			fmt.Println("not json")
 			continue
@@ -308,16 +314,89 @@ func TestRapidOCR_ContextCanceledKillsWorker(t *testing.T) {
 	}
 }
 
+// worker 收到請求後、回應前就結束（送出瞬間死掉）：自動重新啟動並重試同一張一次，該張成功。
 func TestRapidOCR_WorkerCrashRestarts(t *testing.T) {
 	r, logPath := fakeRapidOCR(t, "crash-first-start")
-	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err == nil || errors.Is(err, ErrNoText) {
-		t.Errorf("worker 結束應回錯誤，得到 %v", err)
-	}
 	if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
-		t.Errorf("下一張應重新啟動 worker 並成功，得到 %q %v", got, err)
+		t.Errorf("worker 回應前結束應自動重試並成功，得到 %q %v", got, err)
 	}
 	if pids := startedPIDs(t, logPath); len(pids) != 2 {
-		t.Errorf("應啟動兩次，得到 %v", pids)
+		t.Errorf("應啟動兩次（重試一次），得到 %v", pids)
+	}
+	if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+		t.Errorf("下一張應沿用新 worker 並成功，得到 %q %v", got, err)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 2 {
+		t.Errorf("下一張不應再啟動，得到 %v", pids)
+	}
+}
+
+// 尚未收到任何回應就讀到 EOF（行程仍在）：同樣重啟並重試一次。
+func TestRapidOCR_EOFBeforeResponseRetries(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "close-stdout-first-start")
+	if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+		t.Errorf("回應前 EOF 應自動重試並成功，得到 %q %v", got, err)
+	}
+	pids := startedPIDs(t, logPath)
+	if len(pids) != 2 || processAlive(pids[0]) {
+		t.Errorf("第一個 worker 應被殺掉回收、共啟動兩次，pids %v", pids)
+	}
+}
+
+// 每次都在回應前結束：只重試一次，之後回錯誤。
+func TestRapidOCR_WorkerCrashRetriesOnlyOnce(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "crash-always")
+	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err == nil || errors.Is(err, ErrNoText) {
+		t.Errorf("重試後仍結束應回錯誤，得到 %v", err)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 2 {
+		t.Errorf("只應重試一次（共啟動兩次），得到 %v", pids)
+	}
+}
+
+// 把關者探測：殺掉 worker 後立刻呼叫（worker 可能尚未被回收，寫入 broken pipe 或讀到 EOF），每次都要成功。
+func TestRapidOCR_KilledWorkerImmediateCallSucceeds(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "echo")
+	for i := 0; i < 20; i++ {
+		if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+			t.Fatalf("第 %d 次：得到 %q %v", i+1, got, err)
+		}
+		pids := startedPIDs(t, logPath)
+		if err := syscall.Kill(pids[len(pids)-1], syscall.SIGKILL); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err != nil || got != "10x10" {
+		t.Fatalf("最後一次：得到 %q %v", got, err)
+	}
+}
+
+// 逾時不重試：只啟動一次。
+func TestRapidOCR_TimeoutNotRetried(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "hang-first-start")
+	r.Timeout = 300 * time.Millisecond
+	if _, err := r.RecognizeText(context.Background(), solid(10, 10, color.White)); err == nil {
+		t.Fatal("逾時應回錯誤")
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 1 {
+		t.Errorf("逾時不應重試，pids %v", pids)
+	}
+}
+
+// ctx 取消不重試：只啟動一次。
+func TestRapidOCR_ContextCanceledNotRetried(t *testing.T) {
+	r, logPath := fakeRapidOCR(t, "hang-first-start")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		waitFor(t, "worker 啟動", func() bool { return len(startedPIDs(t, logPath)) == 1 })
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := r.RecognizeText(ctx, solid(10, 10, color.White)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("應回 context.Canceled，得到 %v", err)
+	}
+	if pids := startedPIDs(t, logPath); len(pids) != 1 {
+		t.Errorf("ctx 取消不應重試，pids %v", pids)
 	}
 }
 

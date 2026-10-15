@@ -12,6 +12,7 @@ import (
 
 	"discordbot/internal/commands"
 	"discordbot/internal/config"
+	"discordbot/internal/index"
 	"discordbot/internal/pipeline"
 	"discordbot/internal/recognize"
 	"discordbot/internal/store"
@@ -54,7 +55,21 @@ func main() {
 	st := store.New(sess, cfg.StorageChannelID)
 	loadStore(ctx, st)
 
-	hooks := commands.NopIndexHooks{}
+	// 來源頻道自動處理：trace.moe 與 OCR 各自排隊（並行數 1）；原訊息一次只處理一則（佇列）。
+	ocr := recognize.NewRapidOCR()
+	idx := index.New()
+	p := &pipeline.Pipeline{
+		API:   sess,
+		Fetch: pipeline.NewHTTPFetcher(),
+		Work:  recognize.Serialize(recognize.NewTraceMoe(cfg.TraceMoeKey, cfg.TraceMoeMinSimilarity), 1),
+		Text:  recognize.SerializeText(ocr),
+		Store: st,
+	}
+	// 索引：頻道新增時掃描、移除時清除；訊息刪除與編輯時更新（Q31）。
+	// pipeline 經由 hooks 寫入索引，頻道移除後不再寫入。
+	hooks := index.NewHooks(ctx, sess, idx, p, st)
+	p.Index = hooks
+
 	router := &commands.Router{
 		Commands: map[string]commands.Handler{
 			commands.CmdChannel: commands.NewChannelHandler(st, sess.State, sess, hooks),
@@ -65,17 +80,9 @@ func main() {
 	sess.AddHandler(onChannelDelete(st, hooks))
 	sess.AddHandler(onGuildDelete(st, hooks))
 	sess.AddHandler(onGuildCreate(st, hooks, sess.State))
-
-	// 來源頻道自動處理：trace.moe 與 OCR 各自排隊（並行數 1）。
-	ocr := recognize.NewRapidOCR()
-	p := &pipeline.Pipeline{
-		API:   sess,
-		Fetch: pipeline.NewHTTPFetcher(),
-		Work:  recognize.Serialize(recognize.NewTraceMoe(cfg.TraceMoeKey, cfg.TraceMoeMinSimilarity), 1),
-		Text:  recognize.SerializeText(ocr),
-		Store: st,
-		Index: pipeline.NopIndex{},
-	}
+	sess.AddHandler(onMessageDelete(hooks))
+	sess.AddHandler(onMessageDeleteBulk(hooks))
+	sess.AddHandler(onMessageUpdate(hooks))
 	sess.AddHandler(onMessageCreate(ctx, p))
 
 	err = sess.Open()
@@ -83,6 +90,11 @@ func main() {
 		log.Fatalf("連線 Discord 失敗：%v", err)
 	}
 	defer sess.Close()
+
+	// 啟動掃描：讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息依舊到新交給佇列補處理。
+	// 掃描期間 /search 回傳已建好的部分（Q52）。
+	hooks.SetBotID(sess.State.User.ID)
+	go hooks.ScanAll(st.Snapshot())
 
 	// 啟動時用 bulk overwrite 同步指令；關機時不刪除（全域指令重新傳播需要時間）。
 	registerCommands(sess, sess.State.User.ID, cfg.DevGuildID)
@@ -117,6 +129,40 @@ func onMessageCreate(ctx context.Context, h messageHandler) func(*discordgo.Sess
 			return
 		}
 		go h.HandleMessage(ctx, e.Message)
+	}
+}
+
+// messageIndexer 依訊息刪除與編輯更新索引（*index.Hooks 直接滿足）。
+type messageIndexer interface {
+	MessageDeleted(channelID, messageID string)
+	MessagesDeleted(channelID string, messageIDs []string)
+	MessageUpdated(m *discordgo.Message)
+}
+
+// onMessageDelete 回傳訊息刪除事件的 handler：移除索引項目（Q31）。
+func onMessageDelete(x messageIndexer) func(*discordgo.Session, *discordgo.MessageDelete) {
+	return func(_ *discordgo.Session, e *discordgo.MessageDelete) {
+		if e.Message == nil {
+			return
+		}
+		x.MessageDeleted(e.ChannelID, e.ID)
+	}
+}
+
+// onMessageDeleteBulk 回傳批次刪除事件的 handler：移除索引項目（Q31）。
+func onMessageDeleteBulk(x messageIndexer) func(*discordgo.Session, *discordgo.MessageDeleteBulk) {
+	return func(_ *discordgo.Session, e *discordgo.MessageDeleteBulk) {
+		x.MessagesDeleted(e.ChannelID, e.Messages)
+	}
+}
+
+// onMessageUpdate 回傳訊息編輯事件的 handler：更新索引（Q31）。
+func onMessageUpdate(x messageIndexer) func(*discordgo.Session, *discordgo.MessageUpdate) {
+	return func(_ *discordgo.Session, e *discordgo.MessageUpdate) {
+		if e.Message == nil {
+			return
+		}
+		x.MessageUpdated(e.Message)
 	}
 }
 

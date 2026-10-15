@@ -16,6 +16,7 @@ import (
 
 // API 是 pipeline 需要的 Discord 方法（*discordgo.Session 直接滿足）。
 type API interface {
+	ChannelMessage(channelID, messageID string, options ...discordgo.RequestOption) (*discordgo.Message, error)
 	ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, options ...discordgo.RequestOption) (*discordgo.Message, error)
 	ChannelMessageDelete(channelID, messageID string, options ...discordgo.RequestOption) error
 	MessageReactionAdd(channelID, messageID, emojiID string, options ...discordgo.RequestOption) error
@@ -48,6 +49,11 @@ type Pipeline struct {
 
 	decodeOnce sync.Once
 	decodeSlot chan struct{} // 容量 1：全域同時只解碼一張原圖
+
+	qmu      sync.Mutex      // 保護以下佇列欄位
+	jobs     []*job          // 排隊中的原訊息，依 ID 由舊到新
+	pending  map[string]bool // 在佇列中或處理中的訊息 ID
+	draining bool            // 是否有處理佇列的 goroutine
 }
 
 // acquireDecode 取得解碼位置，回傳釋放函式；ctx 先結束時回 nil。

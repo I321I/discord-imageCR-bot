@@ -28,10 +28,14 @@ const (
 // errOCRClosed 表示 RapidOCR 已 Close，不再啟動 worker。
 var errOCRClosed = errors.New("rapidocr closed")
 
+// errWorkerGone 表示 worker 在回應前就結束（寫入失敗，或尚未收到任何回應就讀到 EOF）。
+var errWorkerGone = errors.New("OCR worker 在回應前結束")
+
 // RapidOCR 透過常駐的 Python 子行程（ocr/ocr_worker.py，RapidOCR + OpenCC）辨識文字（Q54）。
 // 以 stdin/stdout 一行一個 JSON 溝通；第一張圖才啟動 worker，閒置 IdleTimeout 後結束（Q55）。
 // 同時只送一張；逾時、worker 結束、輸出非 JSON 或 id 不符時殺掉 worker，下一張重新啟動。
-// 送出前發現 worker 已結束（兩張之間意外結束）時直接重新啟動，該張不失敗。
+// 送出前發現 worker 已結束（兩張之間意外結束）時直接重新啟動，該張不失敗；
+// 送出瞬間 worker 結束（寫入失敗、尚未收到回應就 EOF）時重新啟動並重試同一張一次（逾時、ctx 結束不重試）。
 type RapidOCR struct {
 	Command      []string      // worker 指令，預設 {"python3", "/app/ocr/ocr_worker.py"}
 	StartTimeout time.Duration // 等待 ready 的上限（0 = 不限）
@@ -121,34 +125,48 @@ func (r *RapidOCR) RecognizeItems(ctx context.Context, img image.Image) ([]OCRIt
 		r.mu.Unlock()
 	}()
 
-	if w != nil && !w.alive() {
-		// 兩張之間 worker 意外結束（OOM 被殺等）：重新啟動，不讓這張失敗。
-		log.Printf("OCR worker 已結束，重新啟動")
-		r.discard(w)
-		w = nil
-	}
-	if w == nil {
-		if w, err = r.start(ctx); err != nil {
+	for attempt := 0; ; attempt++ {
+		if w != nil && !w.alive() {
+			// 兩張之間 worker 意外結束（OOM 被殺等）：重新啟動，不讓這張失敗。
+			log.Printf("OCR worker 已結束，重新啟動")
+			r.discard(w)
+			w = nil
+		}
+		if w == nil {
+			if w, err = r.start(ctx); err != nil {
+				return nil, err
+			}
+		}
+		r.nextID++
+		req, err := json.Marshal(struct {
+			ID  int64  `json:"id"`
+			PNG []byte `json:"png"` // base64
+		}{r.nextID, data})
+		if err != nil {
 			return nil, err
 		}
+		msg, err := r.exchange(ctx, w, append(req, '\n'), r.nextID)
+		if err != nil {
+			r.discard(w)
+			if attempt == 0 && errors.Is(err, errWorkerGone) && ctx.Err() == nil && !r.isClosed() {
+				log.Printf("%v，重新啟動並重試同一張", err)
+				w = nil
+				continue
+			}
+			return nil, err
+		}
+		if msg.Error != "" {
+			return nil, fmt.Errorf("OCR worker 辨識失敗：%s", msg.Error)
+		}
+		return msg.Items, nil
 	}
-	r.nextID++
-	req, err := json.Marshal(struct {
-		ID  int64  `json:"id"`
-		PNG []byte `json:"png"` // base64
-	}{r.nextID, data})
-	if err != nil {
-		return nil, err
-	}
-	msg, err := r.exchange(ctx, w, append(req, '\n'), r.nextID)
-	if err != nil {
-		r.discard(w)
-		return nil, err
-	}
-	if msg.Error != "" {
-		return nil, fmt.Errorf("OCR worker 辨識失敗：%s", msg.Error)
-	}
-	return msg.Items, nil
+}
+
+// isClosed 回傳是否已 Close。
+func (r *RapidOCR) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
 }
 
 // exchange 送出一行請求並等待對應 id 的回應。回傳錯誤時 worker 已不可再用（呼叫端要殺掉）。
@@ -164,12 +182,12 @@ func (r *RapidOCR) exchange(ctx context.Context, w *ocrWorker, req []byte, id in
 		select {
 		case err := <-writeErr:
 			if err != nil {
-				return nil, fmt.Errorf("送出 OCR 請求失敗：%w", err)
+				return nil, fmt.Errorf("%w：送出請求失敗：%w", errWorkerGone, err)
 			}
 			writeErr = nil
 		case line, ok := <-w.lines:
 			if !ok {
-				return nil, errors.New("OCR worker 意外結束")
+				return nil, errWorkerGone
 			}
 			var msg workerMessage
 			if err := json.Unmarshal(line, &msg); err != nil {
