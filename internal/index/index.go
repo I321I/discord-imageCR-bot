@@ -138,6 +138,17 @@ func (x *Index) PutLegacy(guildID string, m *discordgo.Message) {
 	x.set(m.ChannelID, m.ID, entries)
 }
 
+// UpdateLegacyText 只更新已收錄的舊圖片訊息的文字（保留附件項目）；沒有收錄或不是舊圖片訊息時不動。
+func (x *Index) UpdateLegacyText(channelID, messageID, text string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	for i, e := range x.channels[channelID][messageID] {
+		if e.Kind == KindLegacy {
+			x.channels[channelID][messageID][i].LegacyText = text
+		}
+	}
+}
+
 // RemoveMessage 移除一則訊息的所有項目。
 func (x *Index) RemoveMessage(channelID, messageID string) {
 	x.mu.Lock()

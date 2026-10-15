@@ -84,17 +84,14 @@ func main() {
 	sess.AddHandler(onMessageDeleteBulk(hooks))
 	sess.AddHandler(onMessageUpdate(hooks))
 	sess.AddHandler(onMessageCreate(ctx, p))
+	// 啟動掃描由 READY 觸發（首次連線與斷線後重新 IDENTIFY 都會收到；RESUME 不會），不在 Open 之後另外掃描。
+	sess.AddHandler(onReady(hooks, st))
 
 	err = sess.Open()
 	if err != nil {
 		log.Fatalf("連線 Discord 失敗：%v", err)
 	}
 	defer sess.Close()
-
-	// 啟動掃描：讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息依舊到新交給佇列補處理。
-	// 掃描期間 /search 回傳已建好的部分（Q52）。
-	hooks.SetBotID(sess.State.User.ID)
-	go hooks.ScanAll(st.Snapshot())
 
 	// 啟動時用 bulk overwrite 同步指令；關機時不刪除（全域指令重新傳播需要時間）。
 	registerCommands(sess, sess.State.User.ID, cfg.DevGuildID)
@@ -163,6 +160,24 @@ func onMessageUpdate(x messageIndexer) func(*discordgo.Session, *discordgo.Messa
 			return
 		}
 		x.MessageUpdated(e.Message)
+	}
+}
+
+// readyScanner 是 READY 時重新掃描需要的方法（*index.Hooks 直接滿足）。
+type readyScanner interface {
+	SetBotID(id string)
+	ScanAll(d *store.Data)
+}
+
+// onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景掃描所有來源頻道（用收到 READY 當下的設定）。
+// 讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息（含斷線期間的訊息）依舊到新交給佇列補處理；
+// 掃描期間 /search 回傳已建好的部分（Q52）。同一頻道重複掃描時舊的會被取消，已在佇列中的訊息不會重複排入。
+func onReady(h readyScanner, st *store.Store) func(*discordgo.Session, *discordgo.Ready) {
+	return func(_ *discordgo.Session, e *discordgo.Ready) {
+		if e.User != nil {
+			h.SetBotID(e.User.ID)
+		}
+		go h.ScanAll(st.Snapshot())
 	}
 }
 

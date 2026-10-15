@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"slices"
+	"strings"
 	"sync"
 
 	"discordbot/internal/recognize"
@@ -16,6 +17,12 @@ import (
 // API 是掃描需要的 Discord 方法（*discordgo.Session 直接滿足）。
 type API interface {
 	ChannelMessages(channelID string, limit int, beforeID, afterID, aroundID string, options ...discordgo.RequestOption) ([]*discordgo.Message, error)
+}
+
+// Writer 是掃描寫入索引的方法（*Index 直接滿足；Hooks 掃描時改用會先確認來源頻道的版本）。
+type Writer interface {
+	PutImageMessage(guildID string, m *discordgo.Message)
+	PutLegacy(guildID string, m *discordgo.Message)
 }
 
 // Backfiller 接收要補處理的原訊息（*pipeline.Pipeline 直接滿足）：只排入佇列，不等待處理完成。
@@ -35,16 +42,22 @@ const (
 //   - 使用者的帶圖訊息，ID 早於 setAt（snowflake 數值比較）→ 舊圖片訊息（PutLegacy）；
 //   - ID 晚於 setAt：帶有 bot 的 ❌（處理失敗過）→ 不補處理也不收錄（決定 10）；其他 → 讀完後由舊到新交給補處理。
 //
+// setAt 不合法（空字串、非數字，設定資料損壞）時無法判斷先後：記 log，使用者的帶圖訊息一律當舊圖片訊息收錄、不補處理。
+//
 // 每讀完一頁就寫進索引（掃描期間搜尋回傳已建好的部分，Q52）。ctx 結束時停止並回錯誤，不交給補處理。
 // 交給 bf 時傳入的也是 ctx；ctx 會在掃描結束後取消時，bf 要自行改用不會隨掃描結束而取消的 ctx（見 Hooks）。
-func ScanChannel(ctx context.Context, api API, x *Index, bf Backfiller, botID, guildID, channelID, setAt string) error {
+func ScanChannel(ctx context.Context, api API, x Writer, bf Backfiller, botID, guildID, channelID, setAt string) error {
+	validSetAt := snowflake.Valid(setAt)
+	if !validSetAt {
+		log.Printf("頻道 %s 的設定時間點 %q 不合法，使用者圖片一律當舊圖片訊息收錄、不補處理", channelID, setAt)
+	}
 	var backfill []*discordgo.Message
 	before := ""
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		page, err := api.ChannelMessages(channelID, scanPageSize, before, "", "")
+		page, err := api.ChannelMessages(channelID, scanPageSize, before, "", "", discordgo.WithContext(ctx))
 		if err != nil {
 			return err
 		}
@@ -57,7 +70,7 @@ func ScanChannel(ctx context.Context, api API, x *Index, bf Backfiller, botID, g
 			case m.Author.ID == botID:
 				x.PutImageMessage(guildID, m)
 			case m.Author.Bot || m.WebhookID != "" || !recognize.Eligible(m):
-			case snowflake.Less(m.ID, setAt):
+			case !validSetAt || snowflake.Less(m.ID, setAt):
 				x.PutLegacy(guildID, m)
 			case hasOwnReaction(m, reactionFailed):
 			default:
@@ -151,11 +164,32 @@ func (h *Hooks) ChannelAdded(guildID, channelID string) {
 }
 
 // ChannelRemoved 停止該頻道進行中的掃描並等它結束，再清除該頻道的索引。
+// 呼叫可能遲到（頻道已被重新加入）：頻道仍是來源時不停止掃描；取得 putMu 後再確認一次，仍是來源就不清除。
 func (h *Hooks) ChannelRemoved(channelID string) {
-	h.stopScan(channelID)
+	if !h.stopScan(channelID) {
+		return
+	}
 	h.putMu.Lock()
 	defer h.putMu.Unlock()
+	if h.isSource(channelID) {
+		return
+	}
 	h.x.RemoveChannel(channelID)
+}
+
+func (h *Hooks) isSource(channelID string) bool {
+	_, _, ok := h.store.Snapshot().SourceChannel(channelID)
+	return ok
+}
+
+// putIfSource 在 putMu 下確認 channelID 仍是來源頻道才執行 put（寫入索引）。
+func (h *Hooks) putIfSource(channelID string, put func()) {
+	h.putMu.Lock()
+	defer h.putMu.Unlock()
+	if !h.isSource(channelID) {
+		return
+	}
+	put()
 }
 
 // PutImageMessage 收錄 pipeline 發出的圖片訊息；該頻道已不是來源頻道時不寫入。
@@ -163,12 +197,21 @@ func (h *Hooks) PutImageMessage(guildID string, m *discordgo.Message) {
 	if m == nil {
 		return
 	}
-	h.putMu.Lock()
-	defer h.putMu.Unlock()
-	if _, _, ok := h.store.Snapshot().SourceChannel(m.ChannelID); !ok {
+	h.putIfSource(m.ChannelID, func() { h.x.PutImageMessage(guildID, m) })
+}
+
+// sourceWriter 是 Hooks 掃描時使用的 Writer：每次寫入都先確認頻道仍是來源（同 PutImageMessage）。
+type sourceWriter struct{ h *Hooks }
+
+func (w sourceWriter) PutImageMessage(guildID string, m *discordgo.Message) {
+	w.h.PutImageMessage(guildID, m)
+}
+
+func (w sourceWriter) PutLegacy(guildID string, m *discordgo.Message) {
+	if m == nil {
 		return
 	}
-	h.x.PutImageMessage(guildID, m)
+	w.h.putIfSource(m.ChannelID, func() { w.h.x.PutLegacy(guildID, m) })
 }
 
 // ScanAll 掃描 d 中所有來源頻道（各頻道各一個 goroutine），全部結束才返回；錯誤記 log。
@@ -195,6 +238,9 @@ func (h *Hooks) startScan(guildID, channelID, setAt string) chan struct{} {
 	h.mu.Lock()
 	old := h.scans[channelID]
 	h.scans[channelID] = s
+	if old != nil {
+		old.cancel() // 登記時就取消，舊掃描不會在新掃描的 goroutine 開始前跑完
+	}
 	botID := h.botID
 	h.wg.Add(1)
 	h.mu.Unlock()
@@ -204,10 +250,9 @@ func (h *Hooks) startScan(guildID, channelID, setAt string) chan struct{} {
 		defer close(s.done)
 		defer cancel()
 		if old != nil {
-			old.cancel()
 			<-old.done
 		}
-		if err := ScanChannel(ctx, h.api, h.x, bf, botID, guildID, channelID, setAt); err != nil && ctx.Err() == nil {
+		if err := ScanChannel(ctx, h.api, sourceWriter{h}, bf, botID, guildID, channelID, setAt); err != nil && ctx.Err() == nil {
 			log.Printf("掃描頻道 %s 失敗：%v", channelID, err)
 		}
 		h.mu.Lock()
@@ -219,9 +264,15 @@ func (h *Hooks) startScan(guildID, channelID, setAt string) chan struct{} {
 	return s.done
 }
 
-// stopScan 取消 channelID 進行中的掃描並等待結束。
-func (h *Hooks) stopScan(channelID string) {
+// stopScan 取消 channelID 進行中的掃描並等待結束，回傳 true。
+// 頻道仍是來源（ChannelRemoved 遲到、頻道已被重新加入）時不停止，回傳 false。
+// 在 h.mu 內確認：設定先更新才呼叫 ChannelAdded 登記掃描，所以這裡看到的登記中掃描若屬於重新加入，一定也看得到頻道是來源。
+func (h *Hooks) stopScan(channelID string) bool {
 	h.mu.Lock()
+	if h.isSource(channelID) {
+		h.mu.Unlock()
+		return false
+	}
 	s := h.scans[channelID]
 	delete(h.scans, channelID)
 	h.mu.Unlock()
@@ -229,6 +280,7 @@ func (h *Hooks) stopScan(channelID string) {
 		s.cancel()
 		<-s.done
 	}
+	return true
 }
 
 // MessageDeleted 移除被刪除訊息的索引項目。
@@ -245,24 +297,33 @@ func (h *Hooks) MessagesDeleted(channelID string, messageIDs []string) {
 
 // MessageUpdated 依編輯後的訊息更新索引：來源頻道中 bot 的圖片訊息重新收錄；
 // 設定時間點之前的使用者帶圖訊息（舊圖片訊息）重新收錄，沒有文字或不再是圖片訊息則移除。
-// 其他訊息（含設定時間點之後、等待處理或處理失敗的原訊息）不動；
-// 使用者訊息的更新沒有附件資訊（Attachments 為 nil）時也不動，附件確定被清空（空陣列）才移除。
+// 設定時間點不合法時，使用者訊息一律視為舊圖片訊息（同掃描）。
+// 其他訊息（含設定時間點之後、等待處理或處理失敗的原訊息）不動。
+// 使用者訊息的更新沒有附件資訊（Attachments 為 nil）時：有文字 → 保留既有附件、只更新已收錄舊圖片訊息的文字；
+// 沒有文字 → 無法判斷，不動。附件確定被清空（空陣列）才移除。
+// 寫入在 putMu 下確認頻道仍是來源（同 PutImageMessage）。
 func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	if m == nil || m.Author == nil {
 		return
 	}
+	botID := h.getBotID()
+	h.putMu.Lock()
+	defer h.putMu.Unlock()
 	guildID, setAt, ok := h.store.Snapshot().SourceChannel(m.ChannelID)
 	if !ok {
 		return
 	}
-	botID := h.getBotID()
 	switch {
 	case botID != "" && m.Author.ID == botID:
 		h.x.PutImageMessage(guildID, m)
 	case m.Author.Bot || m.WebhookID != "":
+	case snowflake.Valid(setAt) && !snowflake.Less(m.ID, setAt):
 	case m.Attachments == nil:
-		// 沒有附件資訊（部分更新）：無法判斷附件是否被移除，保守不動。
-	case snowflake.Less(m.ID, setAt):
+		// 沒有附件資訊（部分更新）：無法判斷附件是否被移除，保留既有附件。
+		if text := strings.TrimSpace(m.Content); text != "" {
+			h.x.UpdateLegacyText(m.ChannelID, m.ID, text)
+		}
+	default:
 		h.x.RemoveMessage(m.ChannelID, m.ID)
 		if recognize.Eligible(m) {
 			h.x.PutLegacy(guildID, m)

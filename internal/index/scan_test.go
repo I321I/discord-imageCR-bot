@@ -310,6 +310,10 @@ func TestHooks_ChannelRemovedDuringScan(t *testing.T) {
 	h.api = api
 	h.ChannelAdded("g", "c")
 	<-api.entered
+	// 實際呼叫端先從設定移除頻道，才呼叫 ChannelRemoved。
+	if err := st.Update(context.Background(), func(d *store.Data) error { d.RemoveChannel("g", "c"); return nil }); err != nil {
+		t.Fatal(err)
+	}
 	removed := make(chan struct{})
 	go func() {
 		h.ChannelRemoved("c")
