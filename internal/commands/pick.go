@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"log"
 	"slices"
 	"strconv"
@@ -32,9 +33,9 @@ const (
 	sourceLabelMax = 100
 )
 
-// SourcesAccess 回傳使用者可用的來源頻道（*access.Resolver 直接滿足）。
+// SourcesAccess 回傳使用者可用的來源頻道，以及結果是否完整（*access.Resolver 直接滿足）。
 type SourcesAccess interface {
-	Available(ctx context.Context, userID string) ([]access.ChannelRef, error)
+	AvailableComplete(ctx context.Context, userID string) (refs []access.ChannelRef, complete bool, err error)
 }
 
 // Sources 實作 /sources：使用者勾選 /search 要搜尋的圖庫頻道。可用場景同 /search（伺服器、bot 私訊、其他私訊）。
@@ -52,6 +53,7 @@ type sourceOption struct {
 // Command 是 /sources 的 handler：先回 deferred ephemeral，再列出可用頻道（需檢視頻道＋讀取訊息歷史）。
 // 每 25 個一個選單，最多 5 個（125 個頻道），再多只列前 125 個並附說明（Q43）。
 // 預設勾選 = 目前的勾選；沒選過 = 全部（Q46、Q47）。可一個都不選（MinValues 0）。
+// 沒有可用頻道時：結果完整回「目前沒有可用的圖庫頻道」，不完整回「目前無法確認權限，請稍後再試」。
 func (s *Sources) Command(ctx context.Context, i *discordgo.InteractionCreate) {
 	err := s.API.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
@@ -62,14 +64,19 @@ func (s *Sources) Command(ctx context.Context, i *discordgo.InteractionCreate) {
 		return
 	}
 	userID := interactionUserID(i.Interaction)
-	refs, err := s.Access.Available(ctx, userID)
+	refs, complete, err := s.Access.AvailableComplete(ctx, userID)
 	if err != nil {
 		log.Printf("interaction %s：查詢可用頻道失敗：%v", i.ID, err)
 		editSources(s.API, i, msgPermissionUnknown, nil)
 		return
 	}
 	if len(refs) == 0 {
-		editSources(s.API, i, msgSourcesNone, nil)
+		// 結果不完整時可能只是暫時查不到（階段 11 決定 3），不說「沒有」。
+		msg := msgSourcesNone
+		if !complete {
+			msg = msgPermissionUnknown
+		}
+		editSources(s.API, i, msg, nil)
 		return
 	}
 	content := msgSourcesPrompt
@@ -103,6 +110,9 @@ func (s *Sources) isSelected(userID string) func(channelID string) bool {
 // 每個選單只負責自己那一頁的頻道：新的勾選 = 原本的勾選（沒選過 = 目前全部可用頻道）去掉這一頁的頻道，再加上這一頁選到的頻道。
 // 這一頁的頻道與選到的值都只接受目前可用的頻道（過濾偽造的值）；看不到但以前選過的頻道不在其中，因此保留（Q47）。
 // 寫入失敗回 Q5 文字，設定不變，選單恢復成目前的勾選。
+// 沒選過的使用者第一次變更時，若可用頻道結果不完整（某伺服器查詢逾時、失敗或暫時不在 state），
+// 本次不儲存，回「目前無法確認權限，請稍後再試」（避免暫時查不到的伺服器被永久排除）。
+// CustomID 的頁碼不存在時只重畫選單、不寫入。
 func (s *Sources) Component(ctx context.Context, i *discordgo.InteractionCreate) {
 	err := s.API.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredMessageUpdate,
@@ -114,7 +124,7 @@ func (s *Sources) Component(ctx context.Context, i *discordgo.InteractionCreate)
 	userID := interactionUserID(i.Interaction)
 	data := i.MessageComponentData()
 	pages := shownPages(i.Message)
-	refs, err := s.Access.Available(ctx, userID)
+	refs, complete, err := s.Access.AvailableComplete(ctx, userID)
 	if err != nil {
 		log.Printf("interaction %s：查詢可用頻道失敗：%v", i.ID, err)
 		editSources(s.API, i, msgPermissionUnknown, sourceMenus(pages, s.isSelected(userID)))
@@ -129,12 +139,21 @@ func (s *Sources) Component(ctx context.Context, i *discordgo.InteractionCreate)
 		pages = pagesOf(refs)
 	}
 
+	n, ok := menuIndex(data.CustomID)
+	if !ok || n >= len(pages) {
+		// 頁碼不存在：只重畫選單（內容不變），不寫入。
+		log.Printf("interaction %s：/sources 選單 CustomID %q 不合法，只重畫選單", i.ID, data.CustomID)
+		content := msgSourcesPrompt
+		if i.Message != nil && i.Message.Content != "" {
+			content = i.Message.Content
+		}
+		editSources(s.API, i, content, sourceMenus(pages, s.isSelected(userID)))
+		return
+	}
 	var pageIDs []string
-	if n, ok := menuIndex(data.CustomID); ok && n < len(pages) {
-		for _, o := range pages[n] {
-			if slices.Contains(available, o.channelID) {
-				pageIDs = append(pageIDs, o.channelID)
-			}
+	for _, o := range pages[n] {
+		if slices.Contains(available, o.channelID) {
+			pageIDs = append(pageIDs, o.channelID)
 		}
 	}
 	picked := slices.DeleteFunc(slices.Clone(data.Values), func(id string) bool { return !slices.Contains(pageIDs, id) })
@@ -143,6 +162,9 @@ func (s *Sources) Component(ctx context.Context, i *discordgo.InteractionCreate)
 	err = s.Store.Update(ctx, func(d *store.Data) error {
 		prev, chosen := d.UserChannels(userID)
 		if !chosen {
+			if !complete {
+				return errSourcesIncomplete
+			}
 			prev = available
 		}
 		next := slices.DeleteFunc(slices.Clone(prev), func(id string) bool { return slices.Contains(pageIDs, id) })
@@ -154,12 +176,19 @@ func (s *Sources) Component(ctx context.Context, i *discordgo.InteractionCreate)
 		d.SetUserChannels(userID, next)
 		return nil
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, errSourcesIncomplete):
+		log.Printf("interaction %s：使用者 %s 的可用頻道結果不完整，第一次變更不儲存", i.ID, userID)
+		content = msgPermissionUnknown
+	case err != nil:
 		log.Printf("儲存使用者 %s 的搜尋頻道失敗：%v", userID, err)
 		content = msgStorageFailed
 	}
 	editSources(s.API, i, content, sourceMenus(pages, s.isSelected(userID)))
 }
+
+// errSourcesIncomplete 表示沒選過的使用者第一次變更時可用頻道結果不完整，本次不儲存。
+var errSourcesIncomplete = errors.New("available channels incomplete")
 
 // shownPages 取出 /sources 訊息中各選單的選項（使用者看到的頁面）。
 // 從 JSON 解出的元件是指標（*ActionsRow、*SelectMenu），自己建立的是值，兩者都接受。

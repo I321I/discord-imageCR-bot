@@ -19,10 +19,10 @@ type syncAvailable struct {
 	refs []access.ChannelRef
 }
 
-func (a *syncAvailable) Available(ctx context.Context, userID string) ([]access.ChannelRef, error) {
+func (a *syncAvailable) AvailableComplete(ctx context.Context, userID string) ([]access.ChannelRef, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return append([]access.ChannelRef(nil), a.refs...), nil
+	return append([]access.ChannelRef(nil), a.refs...), true, nil
 }
 
 // 兩個選單幾乎同時送出：兩頁的變更都要保留（新勾選在 store.Update 內計算）。
@@ -94,24 +94,71 @@ func TestGK10_FirstChangeThenNewSourceNotAutoAdded(t *testing.T) {
 	}
 }
 
-// 記錄目前行為（待 PM／使用者決定）：沒選過的使用者第一次變更時，若 Available 暫時少了某伺服器
-// （成員查詢逾時、失敗或伺服器暫時不在 state），該伺服器的頻道被永久排除在勾選之外。
+// 原為「記錄目前行為」，依階段 10 把關後的使用者決定 (A) 改為斷言新行為：
+// 沒選過的使用者第一次變更時，若 Available 結果不完整（成員查詢逾時、失敗或伺服器暫時不在 state），
+// 本次不儲存，回「目前無法確認權限，請稍後再試」，選單恢復成目前的勾選（全部）。
 func TestGK10_TransientMissingServerOnFirstChange(t *testing.T) {
 	e := newPKEnv(t, ref("1", "c1"), ref("2", "d1"))
 	msg := e.shown(t)
 	e.access.refs[pkUser] = []access.ChannelRef{ref("1", "c1")} // 伺服器 2 暫時查不到
+	e.access.incomplete = true
 	e.s.Component(context.Background(), sourcesSelect(pkUser, SourcesMenuPrefix+":0", []string{"c1"}, msg))
-	ids, ok := chosen(t, e.st)
-	t.Logf("目前行為：chosen=%v ids=%v（d1 是否被排除：%v）", ok, ids, !containsStr(ids, "d1"))
+	if ids, ok := chosen(t, e.st); ok {
+		t.Errorf("結果不完整時不應儲存，得到勾選 %v", ids)
+	}
+	if len(e.fake.Sent) != 0 {
+		t.Errorf("不應寫入儲存頻道，寄出 %d 則", len(e.fake.Sent))
+	}
+	ed := lastSourcesEdit(t, e.fake)
+	if *ed.Content != msgPermissionUnknown {
+		t.Errorf("內容 %q，預期 %q", *ed.Content, msgPermissionUnknown)
+	}
+	if got := defaults(menus(t, *ed.Components)); !sameSet(got, []string{"c1", "d1"}) {
+		t.Errorf("選單應恢復成目前的勾選（全部），得到 %v", got)
+	}
 }
 
-// 記錄目前行為：CustomID 不合法（例如 pickch:9）時，沒選過的使用者仍被寫成「已選全部可用頻道」並寫入儲存頻道。
-func TestGK10_InvalidMenuIndexStillWrites(t *testing.T) {
-	e := newPKEnv(t, ref("1", "c1"))
+// 決定 (A) 只適用於沒選過的使用者：已選過的使用者即使結果不完整也照常儲存
+// （看不到的頻道依 Q47 保留，不會因暫時查不到而遺失）。
+func TestGK10_IncompleteButAlreadyChosenStillSaves(t *testing.T) {
+	e := newPKEnv(t, ref("1", "c1"), ref("1", "c2"), ref("2", "d1"))
+	e.choose(t, "c1", "d1")
 	msg := e.shown(t)
-	e.s.Component(context.Background(), sourcesSelect(pkUser, SourcesMenuPrefix+":9", []string{"c1"}, msg))
+	e.access.refs[pkUser] = []access.ChannelRef{ref("1", "c1"), ref("1", "c2")} // 伺服器 2 暫時查不到
+	e.access.incomplete = true
+	e.s.Component(context.Background(), sourcesSelect(pkUser, SourcesMenuPrefix+":0", []string{"c2"}, msg))
 	ids, ok := chosen(t, e.st)
-	t.Logf("目前行為：chosen=%v ids=%v 寄出儲存訊息 %d 則", ok, ids, len(e.fake.Sent))
+	if !ok || !sameSet(ids, []string{"c2", "d1"}) {
+		t.Errorf("勾選 %v（ok=%v），預期 [c2 d1]", ids, ok)
+	}
+	if ed := lastSourcesEdit(t, e.fake); *ed.Content != msgSourcesUpdated {
+		t.Errorf("內容 %q，預期 %q", *ed.Content, msgSourcesUpdated)
+	}
+}
+
+// 原為「記錄目前行為」，依 PM 決定改為斷言新行為：CustomID 不合法（頁碼不存在，例如 pickch:9 或超出顯示的頁數）時
+// 只重畫選單（內容不變），不寫入。
+func TestGK10_InvalidMenuIndexStillWrites(t *testing.T) {
+	for _, id := range []string{SourcesMenuPrefix + ":9", SourcesMenuPrefix + ":1", SourcesMenuPrefix + ":x", "pickch"} {
+		t.Run(id, func(t *testing.T) {
+			e := newPKEnv(t, ref("1", "c1"))
+			msg := e.shown(t)
+			e.s.Component(context.Background(), sourcesSelect(pkUser, id, []string{"c1"}, msg))
+			if ids, ok := chosen(t, e.st); ok {
+				t.Errorf("不合法 CustomID 不應儲存，得到勾選 %v", ids)
+			}
+			if len(e.fake.Sent) != 0 {
+				t.Errorf("不應寫入儲存頻道，寄出 %d 則", len(e.fake.Sent))
+			}
+			ed := lastSourcesEdit(t, e.fake)
+			if *ed.Content != msg.Content {
+				t.Errorf("內容 %q，預期維持 %q", *ed.Content, msg.Content)
+			}
+			if got := defaults(menus(t, *ed.Components)); !sameSet(got, []string{"c1"}) {
+				t.Errorf("選單應重畫成目前的勾選，得到 %v", got)
+			}
+		})
+	}
 }
 
 func containsStr(s []string, v string) bool {

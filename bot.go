@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
@@ -23,10 +25,7 @@ import (
 )
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("警告：無法載入 .env 檔案，將嘗試直接讀取系統環境變數")
-	}
+	loadDotEnv(".env")
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		log.Fatal(err)
@@ -210,21 +209,39 @@ func onMessageUpdate(x messageIndexer) func(*discordgo.Session, *discordgo.Messa
 	}
 }
 
-// readyScanner 是 READY 時重新掃描需要的方法（*index.Hooks 直接滿足）。
+// readyScanner 是 READY 時清除與重新掃描需要的方法（*index.Hooks 直接滿足）。
 type readyScanner interface {
+	commands.IndexHooks
 	SetBotID(id string)
 	ScanAll(d *store.Data)
 }
 
-// onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景掃描所有來源頻道（用收到 READY 當下的設定）。
-// 讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息（含斷線期間的訊息）依舊到新交給佇列補處理；
+// onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景先清除、再掃描所有來源頻道。
+// 清除：比對 READY 中 bot 所在的伺服器（暫時無法使用的也算仍在），移除已不在的伺服器的來源頻道（離線期間被踢出的殘留，
+// 階段 11 決定 1）；沒有變動時不寫入；伺服器清單為空時不清除（PM 決定，比照 GUILD_CREATE）。
+// 掃描（用清除後的設定）：讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息（含斷線期間的訊息）依舊到新交給佇列補處理；
 // 掃描期間 /search 回傳已建好的部分（Q52）。同一頻道重複掃描時舊的會被取消，已在佇列中的訊息不會重複排入。
 func onReady(h readyScanner, st *store.Store) func(*discordgo.Session, *discordgo.Ready) {
 	return func(_ *discordgo.Session, e *discordgo.Ready) {
+		receivedAt := time.Now()
 		if e.User != nil {
 			h.SetBotID(e.User.ID)
 		}
-		go h.ScanAll(st.Snapshot())
+		present := make([]string, 0, len(e.Guilds))
+		for _, g := range e.Guilds {
+			if g != nil {
+				present = append(present, g.ID)
+			}
+		}
+		go func() {
+			if len(present) == 0 {
+				// 比照 GUILD_CREATE 頻道清單為空就跳過：清單為空可能是異常的 READY，不清除任何來源頻道。
+				log.Print("READY 的伺服器清單為空，不清除來源頻道")
+			} else {
+				commands.PruneMissingGuilds(context.Background(), st, h, present, receivedAt)
+			}
+			h.ScanAll(st.Snapshot())
+		}()
 	}
 }
 
@@ -243,6 +260,19 @@ func onChannelDelete(st *store.Store, hooks commands.IndexHooks) func(*discordgo
 			return
 		}
 		commands.ChannelDeleted(context.Background(), st, hooks, e.GuildID, e.ID)
+	}
+}
+
+// loadDotEnv 載入 path（.env）中的環境變數（不覆蓋已設定的）。
+// 檔案不存在是正常情況（Docker 中以 --env-file 傳入，映像內沒有 .env），只記一般 log；
+// 檔案存在但載入失敗才印警告。
+func loadDotEnv(path string) {
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		log.Printf("沒有 %s 檔案，直接讀取環境變數", path)
+		return
+	}
+	if err := godotenv.Load(path); err != nil {
+		log.Printf("警告：無法載入 %s 檔案，將直接讀取環境變數：%v", path, err)
 	}
 }
 

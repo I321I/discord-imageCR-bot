@@ -250,13 +250,55 @@ func PruneMissingChannels(ctx context.Context, st *store.Store, hooks IndexHooks
 		exists[id] = true
 	}
 	shouldRemove := func(id, setAt string) bool {
-		if exists[id] {
-			return false
-		}
-		t, err := discordgo.SnowflakeTimestamp(setAt)
-		return err == nil && t.Before(receivedAt)
+		return !exists[id] && setBefore(setAt, receivedAt)
 	}
 	removeGuildChannels(ctx, st, hooks, guildID, shouldRemove, "頻道已不存在")
+}
+
+// setBefore 回傳設定時間點 setAt（snowflake）是否早於 t；無法解析時無法判斷先後，回 false。
+func setBefore(setAt string, t time.Time) bool {
+	at, err := discordgo.SnowflakeTimestamp(setAt)
+	return err == nil && at.Before(t)
+}
+
+// PruneMissingGuilds 比對 bot 目前所在的伺服器（READY 事件中的伺服器 ID，暫時無法使用的也算仍在），
+// 移除設定中已不在的伺服器的來源頻道（離線期間被踢出的殘留）並寫回一次，成功後對每個被移除的頻道通知索引。
+// 沒有變動時不寫入；寫入失敗只記 log。同 PruneMissingChannels，只移除設定時間點早於 receivedAt（收到 READY 的時間）
+// 的來源頻道，setAt 無法解析時不移除。
+func PruneMissingGuilds(ctx context.Context, st *store.Store, hooks IndexHooks, presentGuildIDs []string, receivedAt time.Time) {
+	present := make(map[string]bool, len(presentGuildIDs))
+	for _, id := range presentGuildIDs {
+		present[id] = true
+	}
+	var removed []string
+	err := st.Update(ctx, func(d *store.Data) error {
+		removed = nil
+		for g := range d.Guilds {
+			if present[g] {
+				continue
+			}
+			for _, id := range d.Channels(g) {
+				if setBefore(d.Guilds[g][id], receivedAt) && d.RemoveChannel(g, id) {
+					removed = append(removed, id)
+				}
+			}
+		}
+		if len(removed) == 0 {
+			return errNotListed
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errNotListed):
+		return
+	case err != nil:
+		log.Printf("已不在的伺服器的來源頻道 %v 移除時寫入儲存頻道失敗：%v", removed, err)
+		return
+	}
+	log.Printf("bot 已不在所屬伺服器的來源頻道 %v 已從設定移除", removed)
+	for _, id := range removed {
+		hooks.ChannelRemoved(id)
+	}
 }
 
 // removeGuildChannels 移除伺服器中 shouldRemove 為 true 的來源頻道並寫回；reason 用於 log。

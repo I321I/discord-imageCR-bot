@@ -17,19 +17,20 @@ import (
 
 const pkUser = "u1"
 
-// fakeAvailable 是假的可用頻道判定：refs[userID] 為使用者可用的頻道。
+// fakeAvailable 是假的可用頻道判定：refs[userID] 為使用者可用的頻道；incomplete 為 true 時回報結果不完整。
 type fakeAvailable struct {
-	refs  map[string][]access.ChannelRef
-	err   error
-	users []string
+	refs       map[string][]access.ChannelRef
+	err        error
+	incomplete bool
+	users      []string
 }
 
-func (a *fakeAvailable) Available(ctx context.Context, userID string) ([]access.ChannelRef, error) {
+func (a *fakeAvailable) AvailableComplete(ctx context.Context, userID string) ([]access.ChannelRef, bool, error) {
 	a.users = append(a.users, userID)
 	if a.err != nil {
-		return nil, a.err
+		return nil, false, a.err
 	}
-	return a.refs[userID], nil
+	return a.refs[userID], !a.incomplete, nil
 }
 
 type pkEnv struct {

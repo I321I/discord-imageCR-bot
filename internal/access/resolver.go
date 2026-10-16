@@ -143,8 +143,8 @@ func (r *Resolver) evictExpired(now time.Time) {
 }
 
 // members 查詢 userID 在 guildIDs 各伺服器的成員資格（快取未命中的並行查詢），回傳是成員的伺服器 → 身分組。
-// 等到全部完成、deadline（> 0 時）或 ctx 結束；未完成或查詢失敗的伺服器不列入。
-func (r *Resolver) members(ctx context.Context, userID string, guildIDs []string, deadline time.Duration) (map[string][]string, error) {
+// 等到全部完成、deadline（> 0 時）或 ctx 結束；未完成或查詢失敗的伺服器不列入，此時 complete 為 false。
+func (r *Resolver) members(ctx context.Context, userID string, guildIDs []string, deadline time.Duration) (roles map[string][]string, complete bool, err error) {
 	out := map[string][]string{}
 	type pending struct {
 		guildID string
@@ -166,19 +166,22 @@ func (r *Resolver) members(ctx context.Context, userID string, guildIDs []string
 		defer t.Stop()
 		timeout = t.C
 	}
+	complete = true
 	for _, w := range waits {
 		select {
 		case <-w.call.done:
-			if w.call.ok && w.call.entry.member {
+			if !w.call.ok {
+				complete = false
+			} else if w.call.entry.member {
 				out[w.guildID] = w.call.entry.roles
 			}
 		case <-timeout:
-			return out, nil
+			return out, false, nil
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 	}
-	return out, nil
+	return out, complete, nil
 }
 
 // requiredPerms 是可用頻道需要的權限：檢視頻道 + 讀取訊息歷史（搜尋、勾選列表、右鍵指令皆同）。
@@ -206,14 +209,17 @@ func (r *Resolver) view(guildID, channelID, userID string, roles []string) (Chan
 }
 
 // available 依設定 d 計算可用頻道：伺服器依 ID（snowflake 數值）排序，同伺服器的頻道依設定時間點由舊到新。
-// state 中沒有的伺服器不查詢成員。
-func (r *Resolver) available(ctx context.Context, d *store.Data, userID string) ([]ChannelRef, error) {
+// state 中沒有的伺服器不查詢成員。complete 為 false 表示結果可能少了某些伺服器
+// （伺服器不在 state、成員查詢失敗或超過 Deadline）。
+func (r *Resolver) available(ctx context.Context, d *store.Data, userID string) (refs []ChannelRef, complete bool, err error) {
 	var guildIDs []string
+	stateComplete := true
 	for g, chs := range d.Guilds {
 		if len(chs) == 0 {
 			continue
 		}
 		if _, err := r.State.Guild(g); err != nil {
+			stateComplete = false
 			continue
 		}
 		guildIDs = append(guildIDs, g)
@@ -224,9 +230,9 @@ func (r *Resolver) available(ctx context.Context, d *store.Data, userID string) 
 		}
 		return strings.Compare(a, b)
 	})
-	roles, err := r.members(ctx, userID, guildIDs, r.Deadline)
+	roles, complete, err := r.members(ctx, userID, guildIDs, r.Deadline)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var out []ChannelRef
 	for _, g := range guildIDs {
@@ -240,12 +246,20 @@ func (r *Resolver) available(ctx context.Context, d *store.Data, userID string) 
 			}
 		}
 	}
-	return out, nil
+	return out, complete && stateComplete, nil
 }
 
 // Available 回傳 userID 可用的來源頻道。未快取的伺服器超過 Deadline 仍未查到時略過（結果可能少了這些伺服器）。
 // ctx 結束時回傳 ctx 的錯誤。
 func (r *Resolver) Available(ctx context.Context, userID string) ([]ChannelRef, error) {
+	refs, _, err := r.available(ctx, r.Store.Snapshot(), userID)
+	return refs, err
+}
+
+// AvailableComplete 同 Available，另外回報結果是否完整：來源伺服器暫時不在 gateway state、
+// 成員查詢失敗（404 以外）或超過 Deadline 時 complete 為 false（結果可能少了這些伺服器）。
+// 伺服器在 state、只是某個頻道不在 state 不影響完整性。
+func (r *Resolver) AvailableComplete(ctx context.Context, userID string) (refs []ChannelRef, complete bool, err error) {
 	return r.available(ctx, r.Store.Snapshot(), userID)
 }
 
@@ -253,7 +267,7 @@ func (r *Resolver) Available(ctx context.Context, userID string) ([]ChannelRef, 
 // 勾選因頻道移除而變成 0 個時 store 已視為沒選過。
 func (r *Resolver) Selected(ctx context.Context, userID string) ([]ChannelRef, error) {
 	d := r.Store.Snapshot()
-	refs, err := r.available(ctx, d, userID)
+	refs, _, err := r.available(ctx, d, userID)
 	if err != nil {
 		return nil, err
 	}
