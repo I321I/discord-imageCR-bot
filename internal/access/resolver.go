@@ -38,14 +38,15 @@ type ChannelRef struct {
 	GuildID, GuildName, ChannelID, ChannelName string
 }
 
-// Resolver 判定使用者可用的來源頻道：被設為來源 ∧ 使用者是該伺服器成員 ∧ 對該頻道有 View Channel。
+// Resolver 判定使用者可用的來源頻道：被設為來源 ∧ 使用者是該伺服器成員 ∧ 對該頻道有 View Channel 與 Read Message History。
 // 成員資格（含身分組）以 REST 查詢並快取 TTL（404 = 非成員，也快取）；頻道權限不快取，每次從 gateway state 現算。
 // 可並行使用。
 type Resolver struct {
 	Members MemberFetcher
 	State   StateReader
 	Store   *store.Store
-	// TTL 是成員快取時間（MEMBER_CACHE_TTL）；≤ 0 表示不快取（進行中的查詢仍會共用）。
+	// TTL 是成員快取時間（MEMBER_CACHE_TTL）；≤ 0 表示不快取、不寫入（進行中的查詢仍會共用）。
+	// 過期項目在每次寫入快取時清除。
 	TTL time.Duration
 	// Now 取得目前時間；nil 時用 time.Now。
 	Now func() time.Time
@@ -119,14 +120,26 @@ func (r *Resolver) fetch(k memberKey, c *memberCall) {
 	r.mu.Lock()
 	if c.ok {
 		c.entry.at = r.now()
-		if r.cache == nil {
-			r.cache = map[memberKey]memberEntry{}
+		if r.TTL > 0 {
+			r.evictExpired(c.entry.at)
+			if r.cache == nil {
+				r.cache = map[memberKey]memberEntry{}
+			}
+			r.cache[k] = c.entry
 		}
-		r.cache[k] = c.entry
 	}
 	delete(r.inflight, k)
 	r.mu.Unlock()
 	close(c.done)
+}
+
+// evictExpired 清除過期的快取項目（寫入時順便清，避免快取隨使用者數無限成長）。呼叫端須持有 r.mu。
+func (r *Resolver) evictExpired(now time.Time) {
+	for k, e := range r.cache {
+		if now.Sub(e.at) >= r.TTL {
+			delete(r.cache, k)
+		}
+	}
 }
 
 // members 查詢 userID 在 guildIDs 各伺服器的成員資格（快取未命中的並行查詢），回傳是成員的伺服器 → 身分組。
@@ -168,7 +181,10 @@ func (r *Resolver) members(ctx context.Context, userID string, guildIDs []string
 	return out, nil
 }
 
-// view 從 gateway state 現算 userID 能否檢視 channelID（須屬於 guildID）。
+// requiredPerms 是可用頻道需要的權限：檢視頻道 + 讀取訊息歷史（搜尋、勾選列表、右鍵指令皆同）。
+const requiredPerms = discordgo.PermissionViewChannel | discordgo.PermissionReadMessageHistory
+
+// view 從 gateway state 現算 userID 能否使用 channelID（須屬於 guildID，且有 requiredPerms）。
 func (r *Resolver) view(guildID, channelID, userID string, roles []string) (ChannelRef, bool) {
 	g, err := r.State.Guild(guildID)
 	if err != nil {
@@ -183,7 +199,7 @@ func (r *Resolver) view(guildID, channelID, userID string, roles []string) (Chan
 	if ch.GuildID != guildID {
 		return ChannelRef{}, false
 	}
-	if ChannelPermissions(g, ch, userID, roles)&discordgo.PermissionViewChannel == 0 {
+	if ChannelPermissions(g, ch, userID, roles)&requiredPerms != requiredPerms {
 		return ChannelRef{}, false
 	}
 	return ChannelRef{GuildID: guildID, GuildName: g.Name, ChannelID: channelID, ChannelName: ch.Name}, true
@@ -248,24 +264,56 @@ func (r *Resolver) Selected(ctx context.Context, userID string) ([]ChannelRef, e
 	return slices.DeleteFunc(refs, func(ref ChannelRef) bool { return !slices.Contains(chosen, ref.ChannelID) }), nil
 }
 
+// ErrLookupFailed 表示成員查詢失敗（404 以外的錯誤），無法確認權限。
+var ErrLookupFailed = errors.New("member lookup failed")
+
 // CanView 回傳 userID 能否使用來源頻道 channelID（用於檢查 client 送來、可被偽造的值）。
-// 不套用 Deadline，等成員查詢完成或 ctx 結束；查詢失敗或 ctx 結束時回 false。
+// 無法確認（查詢失敗或 ctx 結束）時回 false；需要區分時用 CheckView。
 func (r *Resolver) CanView(ctx context.Context, userID, channelID string) bool {
+	ok, err := r.CheckView(ctx, userID, channelID)
+	return ok && err == nil
+}
+
+// CheckView 同 CanView，但區分「沒權限」與「無法確認」：
+// 不是來源頻道、不是成員、頻道權限不足 → (false, nil)；成員查詢失敗 → ErrLookupFailed；ctx 結束 → ctx 的錯誤。
+// 不套用 Deadline，等成員查詢完成或 ctx 結束。
+func (r *Resolver) CheckView(ctx context.Context, userID, channelID string) (bool, error) {
 	guildID, _, ok := r.Store.Snapshot().SourceChannel(channelID)
 	if !ok {
-		return false
+		return false, nil
 	}
 	if _, err := r.State.Guild(guildID); err != nil {
-		return false
+		return false, nil
 	}
-	roles, err := r.members(ctx, userID, []string{guildID}, 0)
-	if err != nil {
-		return false
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
-	rs, ok := roles[guildID]
+	e, call, ok := r.lookup(guildID, userID)
 	if !ok {
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+		if !call.ok {
+			return false, ErrLookupFailed
+		}
+		e = call.entry
+	}
+	if !e.member {
+		return false, nil
+	}
+	_, ok = r.view(guildID, channelID, userID, e.roles)
+	return ok, nil
+}
+
+// CanViewMember 以呼叫端提供的成員身分組（interaction 自帶的 Member.Roles）判定 userID 能否使用來源頻道 channelID，
+// 不查詢 REST、不使用成員快取。channelID 必須是 guildID 的來源頻道（roles 只對該伺服器有效）。
+func (r *Resolver) CanViewMember(guildID, userID, channelID string, roles []string) bool {
+	g, _, ok := r.Store.Snapshot().SourceChannel(channelID)
+	if !ok || g != guildID {
 		return false
 	}
-	_, ok = r.view(guildID, channelID, userID, rs)
+	_, ok = r.view(guildID, channelID, userID, roles)
 	return ok
 }

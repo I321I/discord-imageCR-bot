@@ -96,7 +96,7 @@ func newEnv(t *testing.T) *env {
 	e.store.UseEmpty()
 	for i := 1; i <= 3; i++ {
 		n := strconv.Itoa(i)
-		addGuild(t, e.state, "g"+n, "伺服器"+n, view)
+		addGuild(t, e.state, "g"+n, "伺服器"+n, viewHist)
 		addChannel(t, e.state, "g"+n, "c"+n, "頻道"+n)
 		addSource(t, e.store, "g"+n, "c"+n, strconv.Itoa(100+i))
 	}
@@ -252,14 +252,14 @@ func TestAvailable_PermissionChangeImmediate(t *testing.T) {
 // 伺服器擁有者、身分組權限也從 state 現算。
 func TestAvailable_RolesFromMember(t *testing.T) {
 	e := newEnv(t)
-	addGuild(t, e.state, "g1", "伺服器1", 0, &discordgo.Role{ID: "viewer", Permissions: view})
+	addGuild(t, e.state, "g1", "伺服器1", 0, &discordgo.Role{ID: "viewer", Permissions: viewHist})
 	addChannel(t, e.state, "g1", "c1", "頻道1")
 	e.members.set("g1")
 	if got := available(t, e.r); len(got) != 0 {
 		t.Errorf("沒有檢視權限的身分組時不可用：%v", got)
 	}
 	e2 := newEnv(t)
-	addGuild(t, e2.state, "g1", "伺服器1", 0, &discordgo.Role{ID: "viewer", Permissions: view})
+	addGuild(t, e2.state, "g1", "伺服器1", 0, &discordgo.Role{ID: "viewer", Permissions: viewHist})
 	addChannel(t, e2.state, "g1", "c1", "頻道1")
 	e2.members.set("g1", "viewer")
 	if got := available(t, e2.r); !slices.Equal(got, []string{"c1"}) {
@@ -459,7 +459,7 @@ func TestAvailable_ConcurrentStateUpdatesNoRace(t *testing.T) {
 			default:
 			}
 			_ = e.state.ChannelAdd(&discordgo.Channel{ID: "c1", GuildID: "g1", Name: "頻道1", PermissionOverwrites: []*discordgo.PermissionOverwrite{roleOW("g1", int64(i%2)*view, 0)}})
-			_ = e.state.GuildAdd(&discordgo.Guild{ID: "g1", Name: "伺服器1", OwnerID: "owner", Roles: []*discordgo.Role{{ID: "g1", Permissions: view}}})
+			_ = e.state.GuildAdd(&discordgo.Guild{ID: "g1", Name: "伺服器1", OwnerID: "owner", Roles: []*discordgo.Role{{ID: "g1", Permissions: viewHist}}})
 		}
 	}()
 	for i := 0; i < 200; i++ {

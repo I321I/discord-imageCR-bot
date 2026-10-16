@@ -61,7 +61,8 @@ func WithPriority(ctx context.Context) context.Context {
 	return context.WithValue(ctx, priorityKey{}, true)
 }
 
-func isPriority(ctx context.Context) bool {
+// IsPriority 回傳 ctx 是否帶有 WithPriority 標記。
+func IsPriority(ctx context.Context) bool {
 	p, _ := ctx.Value(priorityKey{}).(bool)
 	return p
 }
@@ -91,7 +92,7 @@ func (s *prioritySem) acquire(ctx context.Context) error {
 		return nil
 	}
 	q := 1
-	if isPriority(ctx) {
+	if IsPriority(ctx) {
 		q = 0
 	}
 	ch := make(chan struct{})

@@ -9,10 +9,8 @@ import (
 
 // 把關者補充：READY 掃描使用的設定快照過期（快照後頻道被移除又重新加入，設定時間點變新）時，
 // 不應以舊的設定時間點掃描並取代 ChannelAdded 的掃描：舊 setAt 與新 setAt 之間的訊息應當舊圖片訊息，不補處理。
-//
-// 目前會失敗（舊快照的掃描取代新掃描，300 被補處理）；機率極低，列為「建議」交 PM 決定，先略過。修正後移除 t.Skip。
+// （階段 7 後的決定 (a)：startScan 在 h.mu 內重新讀目前設定的 setAt。）
 func TestGK_StaleReadySnapshotDoesNotOverrideNewerSetAt(t *testing.T) {
-	t.Skip("把關者建議項：ScanAll 以過期快照的 setAt 取代較新的掃描；待 PM 決定是否修正")
 	f, st, x, bf, h := newHooksEnv(t)
 	addUserImage(f, "c", "300", "舊設定之後、新設定之前")
 	addSource(t, st, "g", "c", "200")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"image"
 	"log"
+	"slices"
 	"sync"
 
 	"discordbot/internal/imagemsg"
@@ -49,6 +50,9 @@ type Pipeline struct {
 
 	decodeOnce sync.Once
 	decodeSlot chan struct{} // 容量 1：全域同時只解碼一張原圖
+
+	rerecOnce sync.Once
+	rerecSlot chan struct{} // 容量 1：「重新辨識」同時只進行一個（排到才下載）
 
 	qmu      sync.Mutex      // 保護以下佇列欄位
 	jobs     []*job          // 排隊中的原訊息，依 ID 由舊到新
@@ -101,32 +105,66 @@ func (p *Pipeline) prepare(ctx context.Context, data []byte) (*prepared, error) 
 // 各自失敗（含沒讀到字、解碼失敗、尺寸超過上限）時該欄為 imagemsg.FailedMarker。
 // 同一時間只解碼一張；解碼並產生縮圖後就釋放原圖與解碼位置，trace.moe 與 OCR 並行（各自已排隊）。
 func (p *Pipeline) Recognize(ctx context.Context, data []byte) imagemsg.Fields {
-	f := imagemsg.Fields{Work: imagemsg.FailedMarker, Text: imagemsg.FailedMarker}
+	return p.recognize(ctx, data, true, true)
+}
+
+// recognize 只辨識 work、text 為 true 的欄位（同 Recognize）；沒要求的欄位留空。
+func (p *Pipeline) recognize(ctx context.Context, data []byte, work, text bool) imagemsg.Fields {
+	var f imagemsg.Fields
+	if work {
+		f.Work = imagemsg.FailedMarker
+	}
+	if text {
+		f.Text = imagemsg.FailedMarker
+	}
 	pre, err := p.prepare(ctx, data)
 	if err != nil {
 		log.Printf("圖片無法辨識：%v", err)
 		return f
 	}
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if pre.workPNG == nil {
-			return
+	if work {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if pre.workPNG == nil {
+				return
+			}
+			w, err := p.Work.RecognizeWork(ctx, pre.workPNG)
+			if err != nil || w == "" {
+				log.Printf("作品辨識失敗：%v", err)
+				return
+			}
+			f.Work = w
+		}()
+	}
+	if text {
+		t, err := recognize.RecognizeWithFallback(ctx, p.Text, pre.subtitle, pre.whole)
+		if err != nil || t == "" {
+			log.Printf("圖片文字辨識失敗：%v", err)
+		} else {
+			f.Text = t
 		}
-		work, err := p.Work.RecognizeWork(ctx, pre.workPNG)
-		if err != nil || work == "" {
-			log.Printf("作品辨識失敗：%v", err)
-			return
-		}
-		f.Work = work
-	}()
-	text, err := recognize.RecognizeWithFallback(ctx, p.Text, pre.subtitle, pre.whole)
-	if err != nil || text == "" {
-		log.Printf("圖片文字辨識失敗：%v", err)
-	} else {
-		f.Text = text
 	}
 	wg.Wait()
 	return f
+}
+
+// RecognizeAttachment 下載附件 a 並只辨識 fields 中的作品、圖片文字（「重新辨識」使用）。
+// 辨識以優先排隊（recognize.WithPriority，Q62）；仍失敗的欄位為 imagemsg.FailedMarker，沒要求的欄位留空。
+// 下載失敗（含超過 25MB、長度不符）時回錯誤、不辨識。不經過原訊息佇列。
+// 同時只進行一個：排到才下載（避免多個附件同時佔記憶體）；排隊中 ctx 結束時回 ctx 的錯誤。
+func (p *Pipeline) RecognizeAttachment(ctx context.Context, a *discordgo.MessageAttachment, fields []imagemsg.Field) (imagemsg.Fields, error) {
+	p.rerecOnce.Do(func() { p.rerecSlot = make(chan struct{}, 1) })
+	select {
+	case p.rerecSlot <- struct{}{}:
+		defer func() { <-p.rerecSlot }()
+	case <-ctx.Done():
+		return imagemsg.Fields{}, ctx.Err()
+	}
+	data, err := p.download(ctx, a)
+	if err != nil {
+		return imagemsg.Fields{}, err
+	}
+	return p.recognize(recognize.WithPriority(ctx), data, slices.Contains(fields, imagemsg.FieldWork), slices.Contains(fields, imagemsg.FieldText)), nil
 }

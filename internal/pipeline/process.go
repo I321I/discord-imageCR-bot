@@ -47,15 +47,9 @@ func (p *Pipeline) Process(ctx context.Context, guildID string, m *discordgo.Mes
 func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Message) error {
 	files := make([][]byte, len(m.Attachments))
 	for i, a := range m.Attachments {
-		if a.Size > MaxAttachmentSize {
-			return fmt.Errorf("附件 %s：%w（%d bytes）", a.Filename, ErrTooLarge, a.Size)
-		}
-		data, err := p.Fetch.Fetch(ctx, a.URL)
+		data, err := p.download(ctx, a)
 		if err != nil {
-			return fmt.Errorf("下載附件 %s 失敗：%w", a.Filename, err)
-		}
-		if len(data) != a.Size {
-			return fmt.Errorf("下載附件 %s 失敗：%w（預期 %d bytes，得到 %d）", a.Filename, ErrSizeMismatch, a.Size, len(data))
+			return err
 		}
 		files[i] = data
 	}
@@ -93,6 +87,21 @@ func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Mes
 		return fmt.Errorf("刪除原訊息失敗：%w", err)
 	}
 	return nil
+}
+
+// download 下載附件：超過 25MB 不下載；長度與 Size 不符視為下載失敗。
+func (p *Pipeline) download(ctx context.Context, a *discordgo.MessageAttachment) ([]byte, error) {
+	if a.Size > MaxAttachmentSize {
+		return nil, fmt.Errorf("附件 %s：%w（%d bytes）", a.Filename, ErrTooLarge, a.Size)
+	}
+	data, err := p.Fetch.Fetch(ctx, a.URL)
+	if err != nil {
+		return nil, fmt.Errorf("下載附件 %s 失敗：%w", a.Filename, err)
+	}
+	if len(data) != a.Size {
+		return nil, fmt.Errorf("下載附件 %s 失敗：%w（預期 %d bytes，得到 %d）", a.Filename, ErrSizeMismatch, a.Size, len(data))
+	}
+	return data, nil
 }
 
 // react 在原訊息加上 bot 的反應；失敗只記 log。

@@ -108,6 +108,15 @@ func Format(f Fields, uploaderID string) string {
 	return format(f, uploaderID)
 }
 
+// FormatStrict 與 Format 相同但不截斷：結果超過 2000 字時 ok=false（編輯表單送出太長時回錯誤、不修改，Q23）。
+func FormatStrict(f Fields, uploaderID string) (content string, ok bool) {
+	for _, field := range []Field{FieldWork, FieldCharacters, FieldKeywords} {
+		f.Set(field, joinLines(f.Get(field)))
+	}
+	out := format(f, uploaderID)
+	return out, utf8.RuneCountInString(out) <= MaxLen
+}
+
 // truncateLimit 回傳欄位長度上限 L：把所有超過 L 的欄位截成 L 字後，總共至少少 excess 字。
 // 取滿足條件的最大 L（至少 1）。
 func truncateLimit(f Fields, excess int) int {

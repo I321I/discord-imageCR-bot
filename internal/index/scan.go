@@ -148,19 +148,16 @@ func (h *Hooks) SetBotID(id string) {
 	h.botID = id
 }
 
-func (h *Hooks) getBotID() string {
+// BotID 回傳 SetBotID 設定的 bot 使用者 ID；尚未連線時為空字串。
+func (h *Hooks) BotID() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.botID
 }
 
-// ChannelAdded 在背景掃描新設定的來源頻道（setAt 取自設定）。
+// ChannelAdded 在背景掃描新設定的來源頻道（伺服器與 setAt 取自目前設定）。
 func (h *Hooks) ChannelAdded(guildID, channelID string) {
-	_, setAt, ok := h.store.Snapshot().SourceChannel(channelID)
-	if !ok {
-		return
-	}
-	h.startScan(guildID, channelID, setAt)
+	h.startScan(channelID)
 }
 
 // ChannelRemoved 停止該頻道進行中的掃描並等它結束，再清除該頻道的索引。
@@ -215,11 +212,12 @@ func (w sourceWriter) PutLegacy(guildID string, m *discordgo.Message) {
 }
 
 // ScanAll 掃描 d 中所有來源頻道（各頻道各一個 goroutine），全部結束才返回；錯誤記 log。
+// d 可能是過期的快照（例如 READY 當下）：每個頻道開始掃描前改讀目前設定，已非來源就略過，是來源就用目前的 setAt。
 func (h *Hooks) ScanAll(d *store.Data) {
 	var dones []chan struct{}
-	for guildID, chs := range d.Guilds {
-		for channelID, setAt := range chs {
-			dones = append(dones, h.startScan(guildID, channelID, setAt))
+	for _, chs := range d.Guilds {
+		for channelID := range chs {
+			dones = append(dones, h.startScan(channelID))
 		}
 	}
 	for _, done := range dones {
@@ -231,11 +229,20 @@ func (h *Hooks) ScanAll(d *store.Data) {
 func (h *Hooks) Wait() { h.wg.Wait() }
 
 // startScan 開始掃描 channelID，回傳掃描結束時關閉的 channel。
+// 在 h.mu 內讀目前設定：已非來源頻道就不掃描（回傳已關閉的 channel）；是來源就用目前的伺服器與 setAt。
+// stopScan 也在 h.mu 內確認來源，所以頻道移除後不會再登記新的掃描。
 // 登記新掃描與取出舊掃描在同一把鎖內完成，並發呼叫時舊的一定會被取消；新掃描等舊的結束才開始。
-func (h *Hooks) startScan(guildID, channelID, setAt string) chan struct{} {
+func (h *Hooks) startScan(channelID string) chan struct{} {
 	ctx, cancel := context.WithCancel(h.ctx)
 	s := &scan{cancel: cancel, done: make(chan struct{})}
 	h.mu.Lock()
+	guildID, setAt, ok := h.store.Snapshot().SourceChannel(channelID)
+	if !ok {
+		h.mu.Unlock()
+		cancel()
+		close(s.done)
+		return s.done
+	}
 	old := h.scans[channelID]
 	h.scans[channelID] = s
 	if old != nil {
@@ -306,7 +313,7 @@ func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	if m == nil || m.Author == nil {
 		return
 	}
-	botID := h.getBotID()
+	botID := h.BotID()
 	h.putMu.Lock()
 	defer h.putMu.Unlock()
 	guildID, setAt, ok := h.store.Snapshot().SourceChannel(m.ChannelID)

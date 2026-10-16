@@ -1,4 +1,4 @@
-// Package access 判定使用者可用的來源頻道：被設為來源 ∧ 使用者是該伺服器成員 ∧ 對該頻道有 View Channel。
+// Package access 判定使用者可用的來源頻道：被設為來源 ∧ 使用者是該伺服器成員 ∧ 對該頻道有 View Channel 與 Read Message History。
 package access
 
 import "github.com/bwmarrin/discordgo"

@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"discordbot/internal/access"
 	"discordbot/internal/commands"
 	"discordbot/internal/config"
 	"discordbot/internal/index"
@@ -70,12 +71,22 @@ func main() {
 	hooks := index.NewHooks(ctx, sess, idx, p, st)
 	p.Index = hooks
 
-	router := &commands.Router{
-		Commands: map[string]commands.Handler{
-			commands.CmdChannel: commands.NewChannelHandler(st, sess.State, sess, hooks),
-			commands.CmdStorage: commands.NewDevHandler(st, devIDs, cfg.StorageChannelID, sess),
-		},
+	// 可用頻道判定（成員快取 MEMBER_CACHE_TTL）：右鍵指令的權限檢查。
+	res := access.NewResolver(sess, sess.State, st, cfg.MemberCacheTTL)
+	cm := &commands.ContextMenu{
+		API:      sess,
+		Access:   res,
+		Store:    st,
+		Index:    hooks,
+		Pipeline: p,
+		BotID:    hooks.BotID,
+		Ctx:      ctx,
 	}
+	router := newRouter(
+		commands.NewChannelHandler(st, sess.State, sess, hooks),
+		commands.NewDevHandler(st, devIDs, cfg.StorageChannelID, sess),
+		cm,
+	)
 	sess.AddHandler(router.Handle)
 	sess.AddHandler(onChannelDelete(st, hooks))
 	sess.AddHandler(onGuildDelete(st, hooks))
@@ -104,6 +115,21 @@ func main() {
 	<-sc
 	log.Print("關閉機器人")
 	shutdown(cancel, ocr)
+}
+
+// newRouter 組出所有 interaction 的分派表：/channel、/storage、兩個右鍵指令與編輯表單。
+func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu) *commands.Router {
+	return &commands.Router{
+		Commands: map[string]commands.Handler{
+			commands.CmdChannel:     channel,
+			commands.CmdStorage:     dev,
+			commands.CmdEditImage:   cm.Edit,
+			commands.CmdRerecognize: cm.Rerecognize,
+		},
+		Modals: map[string]commands.Handler{
+			commands.EditModalPrefix: cm.EditSubmit,
+		},
+	}
 }
 
 // shutdown 先取消 ctx（進行中的處理以錯誤結束、不發出圖片訊息），再結束 OCR worker。
