@@ -71,7 +71,7 @@ func main() {
 	hooks := index.NewHooks(ctx, sess, idx, p, st)
 	p.Index = hooks
 
-	// 可用頻道判定（成員快取 MEMBER_CACHE_TTL）：右鍵指令的權限檢查。
+	// 可用頻道判定（成員快取 MEMBER_CACHE_TTL）：右鍵指令的權限檢查與 /search 的搜尋範圍。
 	res := access.NewResolver(sess, sess.State, st, cfg.MemberCacheTTL)
 	cm := &commands.ContextMenu{
 		API:      sess,
@@ -82,10 +82,19 @@ func main() {
 		BotID:    hooks.BotID,
 		Ctx:      ctx,
 	}
+	// /search：搜尋使用者要搜尋的頻道（可用頻道 ∩ 勾選）中的圖，貼圖時重新抓訊息並重新上傳。
+	search := &commands.Search{
+		API:    sess,
+		Access: res,
+		Index:  idx,
+		Fetch:  pipeline.NewHTTPFetcher(),
+		Ctx:    ctx,
+	}
 	router := newRouter(
 		commands.NewChannelHandler(st, sess.State, sess, hooks),
 		commands.NewDevHandler(st, devIDs, cfg.StorageChannelID, sess),
 		cm,
+		search,
 	)
 	sess.AddHandler(router.Handle)
 	sess.AddHandler(onChannelDelete(st, hooks))
@@ -117,14 +126,18 @@ func main() {
 	shutdown(cancel, ocr)
 }
 
-// newRouter 組出所有 interaction 的分派表：/channel、/storage、兩個右鍵指令與編輯表單。
-func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu) *commands.Router {
+// newRouter 組出所有 interaction 的分派表：/channel、/storage、兩個右鍵指令與編輯表單、/search 與其 autocomplete。
+func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu, search *commands.Search) *commands.Router {
 	return &commands.Router{
 		Commands: map[string]commands.Handler{
 			commands.CmdChannel:     channel,
 			commands.CmdStorage:     dev,
 			commands.CmdEditImage:   cm.Edit,
 			commands.CmdRerecognize: cm.Rerecognize,
+			commands.CmdSearch:      search.Submit,
+		},
+		Autocomplete: map[string]commands.Handler{
+			commands.CmdSearch: search.Autocomplete,
 		},
 		Modals: map[string]commands.Handler{
 			commands.EditModalPrefix: cm.EditSubmit,

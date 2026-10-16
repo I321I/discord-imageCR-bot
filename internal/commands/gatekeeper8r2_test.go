@@ -96,8 +96,9 @@ func TestGK8R2_ConcurrentOps_NoLockLeak(t *testing.T) {
 	}
 }
 
-// 偽造 token：別人（也有權限）送出 A 的 CustomID 會取走 A 的記錄。
-// 這裡只記錄目前行為（記錄未綁定使用者），不當作失敗：B 本來就有權限直接修改。
+// 偽造 token：別人（也有權限）送出 A 的 CustomID。
+// 原本只記錄行為（記錄未綁定使用者，B 會取走 A 的記錄）；階段 8 收尾依 S3 決定改為斷言：
+// 記錄綁定開表單的使用者，不同使用者送出時不取走、也不刪除，A 之後送出仍用得到。
 func TestGK8R2_FormRecordNotBoundToUser_Documented(t *testing.T) {
 	e := newCMEnv(t)
 	e.access.allowed["u2"] = []string{cmSource}
@@ -105,9 +106,11 @@ func TestGK8R2_FormRecordNotBoundToUser_Documented(t *testing.T) {
 	m := e.imageMessage(orig, "up")
 	idA := openForm(t, e, m, "ia")
 	e.c.EditSubmit(context.Background(), submit(idA, "u2", formValues(orig)))
+	if n := e.c.formCount(); n != 1 {
+		t.Errorf("他人送出不應取走 A 的記錄，剩 %d 筆", n)
+	}
+	e.c.EditSubmit(context.Background(), submit(idA, cmUser, formValues(orig)))
 	if n := e.c.formCount(); n != 0 {
-		t.Logf("記錄仍在：%d", n)
-	} else {
-		t.Log("目前行為：他人送出相同 CustomID 會取走 A 的記錄（A 送出時退回全部套用）")
+		t.Errorf("A 送出後應取走記錄，剩 %d 筆", n)
 	}
 }

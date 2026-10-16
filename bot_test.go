@@ -382,13 +382,16 @@ func TestOnMessageEvents_UpdateIndex(t *testing.T) {
 // 右鍵指令與編輯表單都接到 router。
 func TestNewRouter_WiresContextMenus(t *testing.T) {
 	nop := func(context.Context, *discordgo.InteractionCreate) {}
-	r := newRouter(nop, nop, &commands.ContextMenu{})
-	for _, name := range []string{commands.CmdChannel, commands.CmdStorage, commands.CmdEditImage, commands.CmdRerecognize} {
+	r := newRouter(nop, nop, &commands.ContextMenu{}, &commands.Search{})
+	for _, name := range []string{commands.CmdChannel, commands.CmdStorage, commands.CmdEditImage, commands.CmdRerecognize, commands.CmdSearch} {
 		if r.Commands[name] == nil {
 			t.Errorf("指令 %s 沒有 handler", name)
 		}
 	}
 	if r.Modals[commands.EditModalPrefix] == nil {
 		t.Error("編輯表單沒有 handler")
+	}
+	if r.Autocomplete[commands.CmdSearch] == nil {
+		t.Error("/search 的 autocomplete 沒有 handler")
 	}
 }

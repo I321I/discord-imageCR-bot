@@ -102,8 +102,8 @@ func TestCanViewMember_UsesGivenRolesWithoutREST(t *testing.T) {
 		{"g1", "c2", []string{"viewer"}, false},     // 別的伺服器的來源頻道
 	}
 	for _, c := range cases {
-		if got := e.r.CanViewMember(c.guild, "u", c.ch, c.roles); got != c.want {
-			t.Errorf("CanViewMember(%s, %s, %v) = %v，預期 %v", c.guild, c.ch, c.roles, got, c.want)
+		if got, err := e.r.CanViewMember(c.guild, "u", c.ch, c.roles); got != c.want || err != nil {
+			t.Errorf("CanViewMember(%s, %s, %v) = %v, %v，預期 %v", c.guild, c.ch, c.roles, got, err, c.want)
 		}
 	}
 	for _, g := range []string{"g1", "g2", "g3"} {
@@ -137,5 +137,20 @@ func TestCheckView_DistinguishesUnknown(t *testing.T) {
 	defer cancel()
 	if ok, err := e2.r.CheckView(ctx, "u", "c1"); ok || !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("逾時應回 ctx 錯誤：%v %v", ok, err)
+	}
+}
+
+// S4（階段 8 收尾）：gateway state 尚未載入該伺服器或頻道時，CanViewMember 回 ErrStateUnknown（無法確認），
+// 不是「沒權限」。
+func TestCanViewMember_StateNotLoadedIsUnknown(t *testing.T) {
+	e := newEnv(t)
+	addSource(t, e.store, "g9", "c9", "200") // 伺服器與頻道都不在 state
+	if ok, err := e.r.CanViewMember("g9", "u", "c9", nil); ok || !errors.Is(err, ErrStateUnknown) {
+		t.Errorf("伺服器未載入應為無法確認：%v %v", ok, err)
+	}
+	addGuild(t, e.state, "g8", "伺服器8", viewHist)
+	addSource(t, e.store, "g8", "c8", "201") // 伺服器在 state，頻道不在
+	if ok, err := e.r.CanViewMember("g8", "u", "c8", nil); ok || !errors.Is(err, ErrStateUnknown) {
+		t.Errorf("頻道未載入應為無法確認：%v %v", ok, err)
 	}
 }

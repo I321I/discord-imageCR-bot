@@ -34,6 +34,7 @@ type Response struct {
 type ResponseEdit struct {
 	Interaction *discordgo.Interaction
 	Edit        *discordgo.WebhookEdit
+	Files       [][]byte // 每個附件的 bytes（依 Edit.Files 順序）
 }
 
 // ReactionCall 是一次 MessageReactionAdd（Op "add"）或 MessageReactionRemove（Op "remove"）呼叫。
@@ -61,9 +62,11 @@ type Fake struct {
 	Deleted       []DeletedMessage
 	Responses     []Response
 	ResponseEdits []ResponseEdit
-	Followups     []Followup
-	ReactionCalls []ReactionCall // 成功的反應新增／移除（依呼叫順序）
-	Calls         map[string]int
+	// ResponseDeletes 是被刪除原始回應（InteractionResponseDelete）的 interaction。
+	ResponseDeletes []*discordgo.Interaction
+	Followups       []Followup
+	ReactionCalls   []ReactionCall // 成功的反應新增／移除（依呼叫順序）
+	Calls           map[string]int
 
 	messages map[string][]*discordgo.Message // channelID → 訊息（依 ID 由舊到新）
 	members  map[string]map[string]*discordgo.Member
@@ -304,8 +307,29 @@ func (f *Fake) InteractionResponseEdit(interaction *discordgo.Interaction, newre
 	if err := f.begin("InteractionResponseEdit"); err != nil {
 		return nil, err
 	}
-	f.ResponseEdits = append(f.ResponseEdits, ResponseEdit{Interaction: interaction, Edit: newresp})
+	var files [][]byte
+	for _, file := range newresp.Files {
+		var b []byte
+		if file.Reader != nil {
+			var err error
+			if b, err = io.ReadAll(file.Reader); err != nil {
+				return nil, err
+			}
+		}
+		files = append(files, b)
+	}
+	f.ResponseEdits = append(f.ResponseEdits, ResponseEdit{Interaction: interaction, Edit: newresp, Files: files})
 	return &discordgo.Message{ID: f.newID()}, nil
+}
+
+func (f *Fake) InteractionResponseDelete(interaction *discordgo.Interaction, options ...discordgo.RequestOption) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.begin("InteractionResponseDelete"); err != nil {
+		return err
+	}
+	f.ResponseDeletes = append(f.ResponseDeletes, interaction)
+	return nil
 }
 
 func (f *Fake) FollowupMessageCreate(interaction *discordgo.Interaction, wait bool, data *discordgo.WebhookParams, options ...discordgo.RequestOption) (*discordgo.Message, error) {

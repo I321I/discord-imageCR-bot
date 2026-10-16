@@ -31,6 +31,7 @@ type fakeAccess struct {
 	calls       int
 	memberCalls []memberCall
 	err         error // CheckView 回傳的錯誤（無法確認權限）
+	memberErr   error // CanViewMember 回傳的錯誤（快速路徑無法確認）
 }
 
 type memberCall struct {
@@ -39,11 +40,14 @@ type memberCall struct {
 }
 
 // CanViewMember 是快速路徑（interaction 自帶的成員身分組）：判定規則同 CanView，另外記錄呼叫。
-func (a *fakeAccess) CanViewMember(guildID, userID, channelID string, roles []string) bool {
+func (a *fakeAccess) CanViewMember(guildID, userID, channelID string, roles []string) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.memberCalls = append(a.memberCalls, memberCall{guildID, userID, channelID, roles})
-	return guildID == cmGuild && slices.Contains(a.allowed[userID], channelID)
+	if a.memberErr != nil {
+		return false, a.memberErr
+	}
+	return guildID == cmGuild && slices.Contains(a.allowed[userID], channelID), nil
 }
 
 // CheckView：err 不為 nil 時回 (false, err)（無法確認），否則依 allowed。
@@ -731,6 +735,7 @@ func TestContextMenuTexts(t *testing.T) {
 		msgAlreadyQueued:           "這則訊息已在處理佇列中，請稍候",
 		msgPermissionUnknown:       "目前無法確認權限，請稍後再試",
 		msgRestarting:              "機器人正在重新啟動，請稍後再試",
+		msgNotSource:               "這個頻道已不是圖庫頻道",
 	}
 	for got, want := range cases {
 		if got != want {
@@ -793,13 +798,14 @@ func TestRerecognize_FailedOriginalAlreadyQueued(t *testing.T) {
 	deferred(t, e.fake, msgAlreadyQueued)
 }
 
-// 輪到時頻道已非來源 → 回「沒有權限」（不是「重新處理完成」）。
+// 輪到時頻道已非來源 → 回「這個頻道已不是圖庫頻道」（不是「重新處理完成」）。
+// 階段 8 收尾依使用者決定改文字（原為「你沒有權限使用此功能」）。
 func TestRerecognize_FailedOriginalNoLongerSource(t *testing.T) {
 	e := newCMEnv(t)
 	m := failedOriginal(e, cmUser, true)
 	e.pipe.reprocErr = pipeline.ErrNotSource
 	e.c.Rerecognize(context.Background(), menu(CmdRerecognize, cmUser, m))
-	deferred(t, e.fake, msgNoPermission)
+	deferred(t, e.fake, msgNotSource)
 }
 
 // ---- S3：關機 ----

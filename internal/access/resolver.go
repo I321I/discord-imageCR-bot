@@ -307,13 +307,23 @@ func (r *Resolver) CheckView(ctx context.Context, userID, channelID string) (boo
 	return ok, nil
 }
 
+// ErrStateUnknown 表示 gateway state 尚未載入該伺服器或頻道，無法確認權限。
+var ErrStateUnknown = errors.New("guild or channel not in gateway state")
+
 // CanViewMember 以呼叫端提供的成員身分組（interaction 自帶的 Member.Roles）判定 userID 能否使用來源頻道 channelID，
-// 不查詢 REST、不使用成員快取。channelID 必須是 guildID 的來源頻道（roles 只對該伺服器有效）。
-func (r *Resolver) CanViewMember(guildID, userID, channelID string, roles []string) bool {
+// 不查詢 REST、不使用成員快取。channelID 必須是 guildID 的來源頻道（roles 只對該伺服器有效），否則 (false, nil)。
+// gateway state 尚未載入該伺服器或頻道時回 ErrStateUnknown（無法確認，不是沒權限）。
+func (r *Resolver) CanViewMember(guildID, userID, channelID string, roles []string) (bool, error) {
 	g, _, ok := r.Store.Snapshot().SourceChannel(channelID)
 	if !ok || g != guildID {
-		return false
+		return false, nil
+	}
+	if _, err := r.State.Guild(guildID); err != nil {
+		return false, ErrStateUnknown
+	}
+	if _, err := r.State.Channel(channelID); err != nil {
+		return false, ErrStateUnknown
 	}
 	_, ok = r.view(guildID, channelID, userID, roles)
-	return ok
+	return ok, nil
 }

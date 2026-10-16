@@ -56,7 +56,7 @@ func Definitions() (global []*discordgo.ApplicationCommand, devGuild []*discordg
 			Contexts:         everywhere(),
 			Options: []*discordgo.ApplicationCommandOption{{
 				Type:         discordgo.ApplicationCommandOptionString,
-				Name:         "關鍵字",
+				Name:         searchOption,
 				Description:  "輸入作品、字幕、角色或關鍵字",
 				Required:     true,
 				Autocomplete: true,

@@ -2,6 +2,7 @@ package discordtest
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
@@ -138,5 +139,28 @@ func TestFake_Reactions(t *testing.T) {
 	}
 	if got := f.ReactionsOn("c1", "m1"); len(got) != 1 {
 		t.Errorf("失敗的新增不應改變反應，得到 %q", got)
+	}
+}
+
+// InteractionResponseEdit 記錄附件 bytes；InteractionResponseDelete 記錄被刪除回應的 interaction。
+func TestFake_ResponseEditFilesAndDelete(t *testing.T) {
+	f := NewFake()
+	i := &discordgo.Interaction{ID: "i1"}
+	_, err := f.InteractionResponseEdit(i, &discordgo.WebhookEdit{Files: []*discordgo.File{{Name: "a.png", Reader: strings.NewReader("png")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.ResponseEdits) != 1 || len(f.ResponseEdits[0].Files) != 1 || string(f.ResponseEdits[0].Files[0]) != "png" {
+		t.Errorf("應記錄附件 bytes：%+v", f.ResponseEdits)
+	}
+	if err := f.InteractionResponseDelete(i); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.ResponseDeletes) != 1 || f.ResponseDeletes[0].ID != "i1" {
+		t.Errorf("應記錄刪除：%+v", f.ResponseDeletes)
+	}
+	f.FailOn["InteractionResponseDelete"] = ErrInjected
+	if err := f.InteractionResponseDelete(i); err != ErrInjected || len(f.ResponseDeletes) != 1 {
+		t.Errorf("應回注入的錯誤且不記錄：%v", err)
 	}
 }
