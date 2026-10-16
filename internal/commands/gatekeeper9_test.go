@@ -92,7 +92,8 @@ func TestGK9_EmptySelected(t *testing.T) {
 }
 
 // 參數值型別被偽造成非字串（數字）時：視為空字串。
-// 記錄目前行為：空字串走自己打的字路徑，Search("") 符合全部 → 貼出 Selected 內最新一張。
+// （階段 9 收尾：原本記錄「貼出 Selected 內最新一張」；依使用者決定改為斷言
+// ephemeral「請輸入關鍵字，或從提示中選擇一張圖片」、不貼圖。）
 func TestGK9_NonStringValueBehaviour(t *testing.T) {
 	e := newSREnv(t)
 	e.image(srChannel, imagemsg.Fields{Work: "芙莉蓮"}, "NEWEST")
@@ -101,29 +102,26 @@ func TestGK9_NonStringValueBehaviour(t *testing.T) {
 	data.Options[0].Value = float64(1)
 	i.Data = data
 	e.s.Submit(context.Background(), i)
-	if len(e.fake.Responses) != 1 {
-		t.Fatalf("應有 1 個回應")
-	}
-	t.Logf("非字串值的回應類型：%d（5 = deferred 貼圖）", e.fake.Responses[0].Response.Type)
-	if len(e.fetch.fetched()) > 0 {
-		t.Logf("目前行為：非字串／空白值會貼出 Selected 內最新的圖（仍不超出 Selected）")
-	}
-	for _, u := range e.fetch.fetched() {
-		if strings.Contains(u, "/"+srHidden+"/") {
-			t.Error("不得下載 Selected 以外的圖")
-		}
+	immediate(t, e.fake, msgSearchEmptyQuery)
+	if len(e.fetch.fetched()) > 0 || e.fake.CallCount("ChannelMessage") != 0 {
+		t.Error("非字串值不應讀訊息或下載")
 	}
 }
 
-// 只有空白的輸入（Discord 可能送出）會貼出最新的圖——記錄目前行為，列為待決定。
+// 只有空白的輸入（Discord 可能送出）。
+// （階段 9 收尾：原本只記錄行為（貼出最新的圖）；依使用者決定改為斷言 ephemeral「請輸入關鍵字…」、不貼圖。）
 func TestGK9_WhitespaceOnlyFreeText(t *testing.T) {
 	e := newSREnv(t)
 	e.image(srChannel, imagemsg.Fields{Work: "芙莉蓮"}, "NEWEST")
 	e.s.Submit(context.Background(), searchSubmit(srUser, "   "))
-	t.Logf("空白輸入的回應類型：%d，下載 %v", e.fake.Responses[0].Response.Type, e.fetch.fetched())
+	immediate(t, e.fake, msgSearchEmptyQuery)
+	if len(e.fetch.fetched()) > 0 {
+		t.Error("空白輸入不應下載")
+	}
 }
 
-// 附件序號在索引中存在、但重新抓到的訊息已少了該附件（PM：從索引移除該筆）。
+// 附件序號在索引中存在、但重新抓到的訊息已少了該附件。
+// （階段 9 收尾：原本只 t.Log 建議；依 PM 決定 1 改為斷言只移除該筆附件，同訊息其他圖保留。）
 func TestGK9_AttachmentOutOfRangeRemovedFromIndex(t *testing.T) {
 	e := newSREnv(t)
 	m := e.legacy(srChannel, "舊的", "A", "B")
@@ -131,19 +129,24 @@ func TestGK9_AttachmentOutOfRangeRemovedFromIndex(t *testing.T) {
 	e.s.Submit(context.Background(), searchSubmit(srUser, srChannel+":"+m.ID+":1"))
 	failedAfterDefer(t, e.fake, msgSearchImageGone)
 	if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Attachment: 1}); ok {
-		t.Log("建議：附件序號越界時從索引移除該筆（目前未移除）")
+		t.Error("附件序號越界時應從索引移除該筆")
+	}
+	if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Attachment: 0}); !ok {
+		t.Error("同訊息的其他附件應保留")
 	}
 }
 
-// 重新抓到的附件已不是圖片（索引過時）：記錄目前行為。
+// 重新抓到的附件已不是圖片（索引過時）。
+// （階段 9 收尾：原本只記錄「仍會重新上傳」；依 PM 決定 2 改為斷言「找不到」、不上傳、移除該筆。）
 func TestGK9_AttachmentNoLongerImage(t *testing.T) {
 	e := newSREnv(t)
 	m := e.legacy(srChannel, "舊的", "A")
 	m.Attachments[0].ContentType = "application/zip"
 	m.Attachments[0].Filename = "a.zip"
 	e.s.Submit(context.Background(), searchSubmit(srUser, srChannel+":"+m.ID+":0"))
-	if len(e.fake.ResponseEdits) == 1 && len(e.fake.ResponseEdits[0].Files) == 1 {
-		t.Log("目前行為：附件已不是圖片仍會重新上傳（建議檢查 IsImageAttachment）")
+	failedAfterDefer(t, e.fake, msgSearchImageGone)
+	if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID}); ok {
+		t.Error("已不是圖片的附件應從索引移除")
 	}
 }
 
@@ -174,8 +177,9 @@ func TestGK9_ChoiceNameBounds(t *testing.T) {
 				u16++
 			}
 		}
+		// （階段 9 收尾：原本只 t.Logf；依 PM 決定 6 改為斷言 UTF-16 長度 ≤ 100。）
 		if u16 > 100 {
-			t.Logf("#%d：UTF-16 長度 %d（> 100；若 Discord 以 UTF-16 計算會被拒）", n, u16)
+			t.Errorf("#%d：UTF-16 長度 %d（> 100）", n, u16)
 		}
 	}
 	// Value（Key 字串）上限 100。

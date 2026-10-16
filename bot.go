@@ -90,11 +90,14 @@ func main() {
 		Fetch:  pipeline.NewHTTPFetcher(),
 		Ctx:    ctx,
 	}
+	// /sources：使用者勾選 /search 要搜尋的頻道（存在儲存頻道）。
+	sources := &commands.Sources{API: sess, Access: res, Store: st}
 	router := newRouter(
 		commands.NewChannelHandler(st, sess.State, sess, hooks),
 		commands.NewDevHandler(st, devIDs, cfg.StorageChannelID, sess),
 		cm,
 		search,
+		sources,
 	)
 	sess.AddHandler(router.Handle)
 	sess.AddHandler(onChannelDelete(st, hooks))
@@ -126,8 +129,9 @@ func main() {
 	shutdown(cancel, ocr)
 }
 
-// newRouter 組出所有 interaction 的分派表：/channel、/storage、兩個右鍵指令與編輯表單、/search 與其 autocomplete。
-func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu, search *commands.Search) *commands.Router {
+// newRouter 組出所有 interaction 的分派表：/channel、/storage、兩個右鍵指令與編輯表單、/search 與其 autocomplete、
+// /sources 與其選單。
+func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu, search *commands.Search, sources *commands.Sources) *commands.Router {
 	return &commands.Router{
 		Commands: map[string]commands.Handler{
 			commands.CmdChannel:     channel,
@@ -135,9 +139,13 @@ func newRouter(channel, dev commands.Handler, cm *commands.ContextMenu, search *
 			commands.CmdEditImage:   cm.Edit,
 			commands.CmdRerecognize: cm.Rerecognize,
 			commands.CmdSearch:      search.Submit,
+			commands.CmdSources:     sources.Command,
 		},
 		Autocomplete: map[string]commands.Handler{
 			commands.CmdSearch: search.Autocomplete,
+		},
+		Components: map[string]commands.Handler{
+			commands.SourcesMenuPrefix: sources.Component,
 		},
 		Modals: map[string]commands.Handler{
 			commands.EditModalPrefix: cm.EditSubmit,

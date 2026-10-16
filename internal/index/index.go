@@ -3,8 +3,10 @@
 package index
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,24 +72,53 @@ type Entry struct {
 	Kind            Kind
 	Fields          imagemsg.Fields // KindImageMessage
 	LegacyText      string          // KindLegacy：原訊息整段文字
-	AttachmentCount int             // 該訊息的附件數
+	AttachmentCount int             // 該訊息的圖片附件數
+	Number          int             // 這張圖是該訊息的第幾張圖片（1 起，只計圖片附件）
+	AttachmentID    string          // 收錄時的附件 ID（貼圖前比對，確認附件沒被換掉）
 }
 
 // Index 是並行安全的記憶體索引。
 type Index struct {
 	mu       sync.RWMutex
-	channels map[string]map[string][]Entry // channelID → messageID → 該訊息的項目（依附件順序）
+	channels map[string]map[string][]stored // channelID → messageID → 該訊息的項目（依附件順序）
+}
+
+// stored 是索引中的一筆項目，連同寫入時正規化好的比對文字（搜尋時不再逐筆正規化）。
+type stored struct {
+	e      Entry
+	fields []normField
+}
+
+// normField 是一個參與比對的欄位（已正規化）與它的符合等級。
+type normField struct {
+	text string
+	rank int
+}
+
+// newStored 計算 e 的比對文字：舊圖片訊息為整段文字；圖片訊息為作品、角色、關鍵字、圖片文字（空欄與失敗標記不比對）。
+func newStored(e Entry) stored {
+	var fields []normField
+	if e.Kind == KindLegacy {
+		fields = []normField{{normalize(e.LegacyText), rankLegacy}}
+	} else {
+		for _, f := range []normField{{e.Fields.Work, rankMain}, {e.Fields.Characters, rankMain}, {e.Fields.Keywords, rankMain}, {e.Fields.Text, rankText}} {
+			if f.text != "" && f.text != imagemsg.FailedMarker {
+				fields = append(fields, normField{normalize(f.text), f.rank})
+			}
+		}
+	}
+	return stored{e: e, fields: fields}
 }
 
 func New() *Index {
-	return &Index{channels: map[string]map[string][]Entry{}}
+	return &Index{channels: map[string]map[string][]stored{}}
 }
 
 // set 以 entries 取代該訊息原有的項目（呼叫時須持有寫鎖）。
-func (x *Index) set(channelID, messageID string, entries []Entry) {
+func (x *Index) set(channelID, messageID string, entries []stored) {
 	msgs := x.channels[channelID]
 	if msgs == nil {
-		msgs = map[string][]Entry{}
+		msgs = map[string][]stored{}
 		x.channels[channelID] = msgs
 	}
 	msgs[messageID] = entries
@@ -104,14 +135,18 @@ func (x *Index) PutImageMessage(guildID string, m *discordgo.Message) {
 	}
 	e := Entry{
 		Key:     Key{ChannelID: m.ChannelID, MessageID: m.ID},
-		GuildID: guildID, Kind: KindImageMessage, Fields: f, AttachmentCount: len(m.Attachments),
+		GuildID: guildID, Kind: KindImageMessage, Fields: f, AttachmentCount: len(m.Attachments), Number: 1,
+	}
+	if len(m.Attachments) > 0 && m.Attachments[0] != nil {
+		e.AttachmentID = m.Attachments[0].ID
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	x.set(m.ChannelID, m.ID, []Entry{e})
+	x.set(m.ChannelID, m.ID, []stored{newStored(e)})
 }
 
 // PutLegacy 收錄（或更新）一則舊圖片訊息：每張圖一筆，文字為原訊息整段文字；沒有文字則不收錄。
+// 張數與編號只計圖片附件；Key.Attachment 是附件在訊息中的位置（含非圖片附件）。
 func (x *Index) PutLegacy(guildID string, m *discordgo.Message) {
 	if m == nil {
 		return
@@ -120,18 +155,21 @@ func (x *Index) PutLegacy(guildID string, m *discordgo.Message) {
 	if text == "" {
 		return
 	}
-	var entries []Entry
+	var entries []stored
 	for i, a := range m.Attachments {
 		if !recognize.IsImageAttachment(a) {
 			continue
 		}
-		entries = append(entries, Entry{
+		entries = append(entries, newStored(Entry{
 			Key:     Key{ChannelID: m.ChannelID, MessageID: m.ID, Attachment: i},
-			GuildID: guildID, Kind: KindLegacy, LegacyText: text, AttachmentCount: len(m.Attachments),
-		})
+			GuildID: guildID, Kind: KindLegacy, LegacyText: text, Number: len(entries) + 1, AttachmentID: a.ID,
+		}))
 	}
 	if len(entries) == 0 {
 		return
+	}
+	for i := range entries {
+		entries[i].e.AttachmentCount = len(entries)
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -142,9 +180,11 @@ func (x *Index) PutLegacy(guildID string, m *discordgo.Message) {
 func (x *Index) UpdateLegacyText(channelID, messageID, text string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	for i, e := range x.channels[channelID][messageID] {
-		if e.Kind == KindLegacy {
-			x.channels[channelID][messageID][i].LegacyText = text
+	entries := x.channels[channelID][messageID]
+	for i, s := range entries {
+		if s.e.Kind == KindLegacy {
+			s.e.LegacyText = text
+			entries[i] = newStored(s.e)
 		}
 	}
 }
@@ -153,11 +193,31 @@ func (x *Index) UpdateLegacyText(channelID, messageID, text string) {
 func (x *Index) RemoveMessage(channelID, messageID string) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+	x.removeMessage(channelID, messageID)
+}
+
+// removeMessage 呼叫時須持有寫鎖。
+func (x *Index) removeMessage(channelID, messageID string) {
 	if msgs := x.channels[channelID]; msgs != nil {
 		delete(msgs, messageID)
 		if len(msgs) == 0 {
 			delete(x.channels, channelID)
 		}
+	}
+}
+
+// RemoveAttachment 只移除 k 指向的一張圖；該訊息沒有其他項目時整則移除。
+func (x *Index) RemoveAttachment(k Key) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	entries := x.channels[k.ChannelID][k.MessageID]
+	kept := slices.DeleteFunc(slices.Clone(entries), func(s stored) bool { return s.e.Key == k })
+	switch {
+	case len(kept) == len(entries):
+	case len(kept) == 0:
+		x.removeMessage(k.ChannelID, k.MessageID)
+	default:
+		x.channels[k.ChannelID][k.MessageID] = kept
 	}
 }
 
@@ -173,9 +233,9 @@ func (x *Index) RemoveChannel(channelID string) {
 func (x *Index) Get(k Key) (Entry, bool) {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
-	for _, e := range x.channels[k.ChannelID][k.MessageID] {
-		if e.Key == k {
-			return e, true
+	for _, s := range x.channels[k.ChannelID][k.MessageID] {
+		if s.e.Key == k {
+			return s.e, true
 		}
 	}
 	return Entry{}, false
@@ -189,81 +249,95 @@ const (
 	rankNone
 )
 
+// hit 是一筆符合的項目與它的等級。
+type hit struct {
+	e    *Entry
+	rank int
+}
+
+// before 回傳 a 是否排在 b 前面（Q37）：等級 → 訊息由新到舊 → 頻道 ID → 附件序號。
+func (a hit) before(b hit) bool {
+	if a.rank != b.rank {
+		return a.rank < b.rank
+	}
+	if c := snowflake.Compare(a.e.Key.MessageID, b.e.Key.MessageID); c != 0 {
+		return c > 0
+	}
+	if a.e.Key.ChannelID != b.e.Key.ChannelID {
+		return a.e.Key.ChannelID < b.e.Key.ChannelID
+	}
+	return a.e.Key.Attachment < b.e.Key.Attachment
+}
+
+// worstFirst 是以「排最後的」為頂端的 heap，用來只保留前 N 名。
+type worstFirst []hit
+
+func (h worstFirst) Len() int           { return len(h) }
+func (h worstFirst) Less(i, j int) bool { return h[j].before(h[i]) }
+func (h worstFirst) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *worstFirst) Push(v any)        { *h = append(*h, v.(hit)) }
+func (h *worstFirst) Pop() any {
+	old := *h
+	v := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return v
+}
+
 // Search 回傳 allowed 頻道中符合 query 的項目，最多 limit 筆（limit ≤ 0 不限）。
 // 比對（Q36）：不分大小寫、全形半形視為相同、以空白分隔的多個詞全部符合（各詞可在不同欄位）；
 // 上傳者與失敗標記不參與比對。
 // 排序（Q37）：有詞符合作品／角色／關鍵字 > 只符合圖片文字 > 舊訊息文字；同級依訊息由新到舊。
 // 空查詢（Q33）：全部項目由新到舊。
+// limit > 0 時只保留前 limit 名（heap），不為全部符合的項目排序。
 func (x *Index) Search(query string, allowed map[string]bool, limit int) []Entry {
 	terms := strings.Fields(normalize(query))
-	type hit struct {
-		e    Entry
-		rank int
+	var hits worstFirst
+	if limit > 0 {
+		hits = make(worstFirst, 0, limit)
 	}
-	var hits []hit
 	x.mu.RLock()
 	for ch, msgs := range x.channels {
 		if !allowed[ch] {
 			continue
 		}
 		for _, entries := range msgs {
-			for _, e := range entries {
-				if r := match(e, terms); r != rankNone {
-					hits = append(hits, hit{e, r})
+			for i := range entries {
+				r := entries[i].match(terms)
+				if r == rankNone {
+					continue
+				}
+				h := hit{&entries[i].e, r}
+				switch {
+				case limit <= 0 || len(hits) < limit:
+					hits = append(hits, h)
+					if limit > 0 && len(hits) == limit {
+						heap.Init(&hits)
+					}
+				case h.before(hits[0]):
+					hits[0] = h
+					heap.Fix(&hits, 0)
 				}
 			}
 		}
 	}
-	x.mu.RUnlock()
-	sort.Slice(hits, func(i, j int) bool {
-		a, b := hits[i], hits[j]
-		if a.rank != b.rank {
-			return a.rank < b.rank
-		}
-		if c := snowflake.Compare(a.e.Key.MessageID, b.e.Key.MessageID); c != 0 {
-			return c > 0
-		}
-		if a.e.Key.ChannelID != b.e.Key.ChannelID {
-			return a.e.Key.ChannelID < b.e.Key.ChannelID
-		}
-		return a.e.Key.Attachment < b.e.Key.Attachment
-	})
-	if limit > 0 && len(hits) > limit {
-		hits = hits[:limit]
-	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].before(hits[j]) })
 	out := make([]Entry, len(hits))
 	for i, h := range hits {
-		out[i] = h.e
+		out[i] = *h.e
 	}
+	x.mu.RUnlock()
 	return out
 }
 
 // match 回傳項目對 terms 的符合等級；有任一詞不符合時回 rankNone。terms 為空時一律符合（等級相同）。
-func match(e Entry, terms []string) int {
-	type field struct {
-		text string
-		rank int
-	}
-	var fields []field
-	if e.Kind == KindLegacy {
-		fields = []field{{normalize(e.LegacyText), rankLegacy}}
-	} else {
-		for _, f := range []struct {
-			v    string
-			rank int
-		}{{e.Fields.Work, rankMain}, {e.Fields.Characters, rankMain}, {e.Fields.Keywords, rankMain}, {e.Fields.Text, rankText}} {
-			if f.v != "" && f.v != imagemsg.FailedMarker {
-				fields = append(fields, field{normalize(f.v), f.rank})
-			}
-		}
-	}
+func (s *stored) match(terms []string) int {
 	if len(terms) == 0 {
 		return rankMain
 	}
 	best := rankNone
 	for _, t := range terms {
 		found := false
-		for _, f := range fields {
+		for _, f := range s.fields {
 			if strings.Contains(f.text, t) {
 				found = true
 				best = min(best, f.rank)

@@ -382,7 +382,7 @@ func TestOnMessageEvents_UpdateIndex(t *testing.T) {
 // 右鍵指令與編輯表單都接到 router。
 func TestNewRouter_WiresContextMenus(t *testing.T) {
 	nop := func(context.Context, *discordgo.InteractionCreate) {}
-	r := newRouter(nop, nop, &commands.ContextMenu{}, &commands.Search{})
+	r := newRouter(nop, nop, &commands.ContextMenu{}, &commands.Search{}, &commands.Sources{})
 	for _, name := range []string{commands.CmdChannel, commands.CmdStorage, commands.CmdEditImage, commands.CmdRerecognize, commands.CmdSearch} {
 		if r.Commands[name] == nil {
 			t.Errorf("指令 %s 沒有 handler", name)
@@ -393,5 +393,17 @@ func TestNewRouter_WiresContextMenus(t *testing.T) {
 	}
 	if r.Autocomplete[commands.CmdSearch] == nil {
 		t.Error("/search 的 autocomplete 沒有 handler")
+	}
+}
+
+// /sources 指令與它的選單接到 router（階段 10）。
+func TestNewRouter_WiresSources(t *testing.T) {
+	nop := func(context.Context, *discordgo.InteractionCreate) {}
+	r := newRouter(nop, nop, &commands.ContextMenu{}, &commands.Search{}, &commands.Sources{})
+	if r.Commands[commands.CmdSources] == nil {
+		t.Error("/sources 沒有 handler")
+	}
+	if r.Components[commands.SourcesMenuPrefix] == nil {
+		t.Error("/sources 的選單沒有 handler")
 	}
 }

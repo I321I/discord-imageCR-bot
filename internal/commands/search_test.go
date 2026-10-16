@@ -203,7 +203,7 @@ func TestChoiceName_Format(t *testing.T) {
 	}
 }
 
-// 作品與圖片文字都是空的（暫定）：改顯示角色、關鍵字；全部空白顯示「（沒有文字）」。
+// 作品與圖片文字都是空的（使用者決定）：改顯示角色、關鍵字；全部空白顯示「（沒有文字）」。
 func TestChoiceName_EmptyFallback(t *testing.T) {
 	if got := ChoiceName(index.Entry{Fields: imagemsg.Fields{Characters: "芙莉蓮、費倫", Keywords: "魔法"}, AttachmentCount: 1}); got != "芙莉蓮、費倫｜魔法" {
 		t.Errorf("得到 %q", got)
@@ -484,22 +484,26 @@ func TestSearchSubmit_DM(t *testing.T) {
 	}
 }
 
-// 下載失敗、長度不符、超過 25MiB、上傳失敗 → 刪除 deferred 回應、ephemeral「貼圖失敗」。
+// 下載失敗、長度不符、超過 25MiB、上傳失敗 → 刪除 deferred 回應、ephemeral 說明原因。
+// （階段 9 收尾：依使用者決定改為區分原因；完整的四種原因見 TestSearchSubmit_PostFailureReasons。）
 func TestSearchSubmit_PostFailures(t *testing.T) {
-	cases := map[string]func(e *srEnv, m *discordgo.Message){
-		"下載失敗": func(e *srEnv, m *discordgo.Message) { e.fetch.err = discordtest.ErrInjected },
-		"長度不符": func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = 999 },
-		"超過上限": func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = pipeline.MaxAttachmentSize + 1 },
-		"上傳失敗": func(e *srEnv, m *discordgo.Message) {
+	cases := map[string]struct {
+		setup func(e *srEnv, m *discordgo.Message)
+		want  string
+	}{
+		"下載失敗": {func(e *srEnv, m *discordgo.Message) { e.fetch.err = discordtest.ErrInjected }, msgSearchDownloadFailed},
+		"長度不符": {func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = 999 }, msgSearchDownloadFailed},
+		"超過上限": {func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = pipeline.MaxAttachmentSize + 1 }, msgSearchTooLarge},
+		"上傳失敗": {func(e *srEnv, m *discordgo.Message) {
 			e.fake.FailOn["InteractionResponseEdit"] = discordtest.ErrInjected
-		},
+		}, msgSearchPostFailed},
 	}
-	for name, setup := range cases {
+	for name, c := range cases {
 		e := newSREnv(t)
 		m := e.image(srChannel, imagemsg.Fields{Work: "芙莉蓮"}, "PNG")
-		setup(e, m)
+		c.setup(e, m)
 		e.s.Submit(context.Background(), searchSubmit(srUser, srChannel+":"+m.ID+":0"))
-		t.Run(name, func(t *testing.T) { failedAfterDefer(t, e.fake, msgSearchPostFailed) })
+		t.Run(name, func(t *testing.T) { failedAfterDefer(t, e.fake, c.want) })
 		if name == "超過上限" && len(e.fetch.fetched()) != 0 {
 			t.Errorf("超過上限不應下載")
 		}

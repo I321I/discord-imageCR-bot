@@ -9,21 +9,33 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf16"
 
 	"discordbot/internal/access"
 	"discordbot/internal/imagemsg"
 	"discordbot/internal/index"
 	"discordbot/internal/pipeline"
+	"discordbot/internal/recognize"
 
 	"github.com/bwmarrin/discordgo"
 )
 
 // /search 的回覆文字（ephemeral）。
 const (
-	msgSearchImageGone  = "找不到這張圖片，可能已被刪除" // 找不到圖或沒權限（不區分，Q40）
-	msgSearchNoMatch    = "找不到符合的圖片"       // 直接送出自己打的字、沒有符合（Q35）
-	msgSearchPostFailed = "貼圖失敗，請稍後再試"     // 下載或上傳失敗（暫定）
+	msgSearchImageGone      = "找不到這張圖片，可能已被刪除"      // 找不到圖或沒權限（不區分，Q40）
+	msgSearchNoMatch        = "找不到符合的圖片"            // 直接送出自己打的字、沒有符合（Q35）
+	msgSearchEmptyQuery     = "請輸入關鍵字，或從提示中選擇一張圖片"  // 只打空白、沒選或值不是字串
+	msgSearchTooLarge       = "圖片超過 25MB，無法貼出"      // 附件 Size > 25MiB，不下載
+	msgSearchUploadTooLarge = "圖片太大，超過這裡的上傳上限，無法貼出" // 上傳被 Discord 以檔案太大拒絕（HTTP 413 或 code 40005）
+	msgSearchDownloadFailed = "下載圖片失敗，請稍後再試"        // 下載失敗（網路、長度不符）
+	msgSearchPostFailed     = "貼圖失敗，請稍後再試"          // 其他上傳錯誤
+	msgSearchQueueTimeout   = "目前貼圖的人太多，請稍後再試"      // 排隊超過 MaxWait（暫定）
 )
+
+// defaultSearchMaxWait 是排隊等貼圖的預設上限：deferred 回應的 token 只有 15 分鐘，
+// 留 1 分鐘給讀訊息、下載與上傳。
+const defaultSearchMaxWait = 14 * time.Minute
 
 const (
 	// searchOption 是 /search 的參數名稱（Q32）。
@@ -34,7 +46,7 @@ const (
 	searchPostSlots = 1
 	// choiceNameMax 是提示文字的長度上限（Discord 上限 100 字）。
 	choiceNameMax = 100
-	// choiceNameEmpty 是沒有任何文字可顯示時的提示文字（暫定）。
+	// choiceNameEmpty 是沒有任何文字可顯示時的提示文字（使用者決定）。
 	choiceNameEmpty = "（沒有文字）"
 )
 
@@ -56,6 +68,7 @@ type SearchIndex interface {
 	Search(query string, allowed map[string]bool, limit int) []index.Entry
 	Get(k index.Key) (index.Entry, bool)
 	RemoveMessage(channelID, messageID string)
+	RemoveAttachment(k index.Key)
 }
 
 // Search 實作 /search 的 autocomplete 與送出。可用場景：伺服器、與 bot 的私訊、其他私訊與群組（Q41）。
@@ -66,6 +79,8 @@ type Search struct {
 	Fetch  pipeline.Fetcher
 	// Ctx 是 bot 關機時才取消的 ctx：排隊等貼圖時關機就放棄；nil 時只用 handler 的 ctx。
 	Ctx context.Context
+	// MaxWait 是排隊等貼圖的上限，超過就放棄（刪除 deferred 回應、改發 ephemeral followup）；0 為 defaultSearchMaxWait。
+	MaxWait time.Duration
 
 	slotOnce sync.Once
 	slots    chan struct{} // 容量 searchPostSlots
@@ -126,11 +141,11 @@ func (s *Search) Autocomplete(ctx context.Context, i *discordgo.InteractionCreat
 }
 
 // ChoiceName 回傳提示文字（Q38）：
-//   - 圖片訊息：「作品｜圖片文字」，空欄省略、失敗欄位顯示「⚠️」；兩欄都空時改顯示「角色｜關鍵字」（暫定），
+//   - 圖片訊息：「作品｜圖片文字」，空欄省略、失敗欄位顯示「⚠️」；兩欄都空時改顯示「角色｜關鍵字」（使用者決定），
 //     全部空白為 choiceNameEmpty；
 //   - 舊圖片訊息：訊息文字開頭；
-//   - 換行與連續空白換成一個空白；一則訊息有多張圖時加「（第 N 張）」；
-//   - 超過 100 字（rune）時截斷文字並加「…」（編號保留）。
+//   - 換行與連續空白換成一個空白；一則訊息有多張圖時加「（第 N 張）」（第 1 張也標；張數與編號只計圖片附件）；
+//   - 超過 100 字時截斷文字並加「…」（編號保留）。長度以 UTF-16 單位計算（保守：emoji 等算 2）。
 func ChoiceName(e index.Entry) string {
 	var body string
 	if e.Kind == index.KindLegacy {
@@ -146,13 +161,38 @@ func ChoiceName(e index.Entry) string {
 	}
 	suffix := ""
 	if e.AttachmentCount > 1 {
-		suffix = fmt.Sprintf("（第 %d 張）", e.Key.Attachment+1)
+		n := e.Number
+		if n <= 0 {
+			n = e.Key.Attachment + 1 // 沒有編號（舊版 Entry）時退回附件位置
+		}
+		suffix = fmt.Sprintf("（第 %d 張）", n)
 	}
-	room := choiceNameMax - len([]rune(suffix))
-	if r := []rune(body); len(r) > room {
-		body = string(r[:room-1]) + "…"
+	return truncateUTF16(body, choiceNameMax-utf16Units(suffix)) + suffix
+}
+
+// truncateUTF16 在 s 的 UTF-16 長度超過 limit 時截斷並加「…」，結果不超過 limit（Discord 以 UTF-16 計算長度上限）。
+func truncateUTF16(s string, limit int) string {
+	if utf16Units(s) <= limit {
+		return s
 	}
-	return body + suffix
+	room := limit - 1 // 「…」
+	var b strings.Builder
+	for _, r := range s {
+		if room -= utf16.RuneLen(r); room < 0 {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String() + "…"
+}
+
+// utf16Units 回傳 s 的 UTF-16 長度。
+func utf16Units(s string) int {
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	return n
 }
 
 // joinShown 以「｜」連接非空的欄位（失敗標記顯示為「⚠️」）。
@@ -181,30 +221,37 @@ func oneLine(s string) string {
 //     值不是 Key（直接送出自己打的字）→ 貼出第一個符合的結果；沒有符合 → ephemeral「找不到符合的圖片」（Q35）。
 //  2. 回 deferred 公開回應 → 排隊（同時貼圖數有上限，排到才讀訊息與下載）→ 重新抓訊息取得最新附件網址 →
 //     下載 → 以附件重新上傳，只發圖片（Q39）。
-//  3. deferred 之後才發現錯誤：刪除 deferred 回應，改發 ephemeral followup。訊息已不存在（404）時從索引移除。
+//  3. deferred 之後才發現錯誤：刪除 deferred 回應，改發 ephemeral followup。訊息已不存在（404）時從索引移除；
+//     附件序號越界、附件 ID 與索引不符或已不是圖片時只移除索引中該筆。
+//
+// 只打空白、沒選或值不是字串：ephemeral「請輸入關鍵字…」，不貼圖。排隊超過 MaxWait 就放棄。
 func (s *Search) Submit(ctx context.Context, i *discordgo.InteractionCreate) {
 	value := optionValue(i)
+	if strings.TrimSpace(value) == "" {
+		respondEphemeral(s.API, i, msgSearchEmptyQuery)
+		return
+	}
 	chs, err := s.selected(ctx, interactionUserID(i.Interaction))
 	if err != nil {
 		log.Printf("interaction %s：查詢可用頻道失敗：%v", i.ID, err)
 		respondEphemeral(s.API, i, msgSearchImageGone)
 		return
 	}
-	var key index.Key
+	var entry index.Entry
 	if k, err := index.ParseKey(value); err == nil {
 		e, ok := s.Index.Get(k)
 		if g, allowed := chs[k.ChannelID]; !ok || !allowed || e.GuildID != g {
 			respondEphemeral(s.API, i, msgSearchImageGone)
 			return
 		}
-		key = k
+		entry = e
 	} else {
 		found := s.Index.Search(value, allowedSet(chs), 1)
 		if len(found) == 0 {
 			respondEphemeral(s.API, i, msgSearchNoMatch)
 			return
 		}
-		key = found[0].Key
+		entry = found[0]
 	}
 
 	err = s.API.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -214,52 +261,107 @@ func (s *Search) Submit(ctx context.Context, i *discordgo.InteractionCreate) {
 		log.Printf("回覆 interaction %s（deferred）失敗：%v", i.ID, err)
 		return
 	}
-	if msg := s.post(ctx, i, key); msg != "" {
+	if msg := s.post(ctx, i, entry); msg != "" {
 		s.failAfterDefer(i, msg)
 	}
 }
 
 // post 排到後讀訊息、下載並以附件補上 deferred 回應；失敗時回傳要告知使用者的文字。
-func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, key index.Key) string {
+func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, entry index.Entry) string {
+	key := entry.Key
 	ctx, cancel := withShutdown(ctx, s.Ctx)
 	defer cancel()
-	release := s.acquire(ctx)
-	if release == nil {
-		log.Printf("interaction %s：等待貼圖時中斷：%v", i.ID, ctx.Err())
+	release, err := s.wait(ctx)
+	if err != nil {
+		log.Printf("interaction %s：等待貼圖時中斷：%v", i.ID, err)
+		if errors.Is(err, errQueueTimeout) {
+			return msgSearchQueueTimeout
+		}
 		return msgRestarting
 	}
 	defer release()
 
 	m, err := s.API.ChannelMessage(key.ChannelID, key.MessageID)
 	if err != nil {
-		var rest *discordgo.RESTError
-		if errors.As(err, &rest) && rest.Response != nil && rest.Response.StatusCode == http.StatusNotFound {
+		if restStatus(err) == http.StatusNotFound {
 			s.Index.RemoveMessage(key.ChannelID, key.MessageID)
 		} else {
 			log.Printf("/search：讀取訊息 %s/%s 失敗：%v", key.ChannelID, key.MessageID, err)
 		}
 		return msgSearchImageGone
 	}
-	if key.Attachment >= len(m.Attachments) || m.Attachments[key.Attachment] == nil {
+	var a *discordgo.MessageAttachment
+	if key.Attachment < len(m.Attachments) {
+		a = m.Attachments[key.Attachment]
+	}
+	if a == nil || (entry.AttachmentID != "" && a.ID != entry.AttachmentID) || !recognize.IsImageAttachment(a) {
+		// 索引過時（附件被移除、換掉或不再是圖片）：只移除這一筆。
+		s.Index.RemoveAttachment(key)
 		return msgSearchImageGone
 	}
-	a := m.Attachments[key.Attachment]
 	data, err := download(ctx, s.Fetch, a)
 	if err != nil {
 		log.Printf("/search：下載 %s/%s 的附件失敗：%v", key.ChannelID, key.MessageID, err)
-		if ctx.Err() != nil {
+		switch {
+		case ctx.Err() != nil:
 			return msgRestarting
+		case errors.Is(err, pipeline.ErrTooLarge):
+			return msgSearchTooLarge
 		}
-		return msgSearchPostFailed
+		return msgSearchDownloadFailed
 	}
 	_, err = s.API.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Files: []*discordgo.File{{Name: a.Filename, ContentType: a.ContentType, Reader: bytes.NewReader(data)}},
 	})
 	if err != nil {
 		log.Printf("/search：上傳圖片（interaction %s）失敗：%v", i.ID, err)
+		if uploadTooLarge(err) {
+			return msgSearchUploadTooLarge
+		}
 		return msgSearchPostFailed
 	}
 	return ""
+}
+
+// restStatus 回傳 Discord REST 錯誤的 HTTP 狀態碼；不是 REST 錯誤時回 0。
+func restStatus(err error) int {
+	var rest *discordgo.RESTError
+	if errors.As(err, &rest) && rest.Response != nil {
+		return rest.Response.StatusCode
+	}
+	return 0
+}
+
+// uploadTooLarge 回傳上傳是否被 Discord 以檔案太大拒絕：HTTP 413，或 JSON 錯誤碼 40005（Request entity too large）。
+func uploadTooLarge(err error) bool {
+	var rest *discordgo.RESTError
+	if !errors.As(err, &rest) {
+		return false
+	}
+	if rest.Response != nil && rest.Response.StatusCode == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	return rest.Message != nil && rest.Message.Code == discordgo.ErrCodeRequestEntityTooLarge
+}
+
+// errQueueTimeout 表示排隊等貼圖超過 MaxWait。
+var errQueueTimeout = errors.New("queue wait exceeded")
+
+// wait 排隊取得貼圖位置，最多等 MaxWait；ctx 先結束時回 ctx 的錯誤，逾時回 errQueueTimeout。
+func (s *Search) wait(ctx context.Context) (release func(), err error) {
+	limit := s.MaxWait
+	if limit <= 0 {
+		limit = defaultSearchMaxWait
+	}
+	wctx, cancel := context.WithTimeoutCause(ctx, limit, errQueueTimeout)
+	defer cancel()
+	if release = s.acquire(wctx); release != nil {
+		return release, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, context.Cause(wctx)
 }
 
 // acquire 取得貼圖位置，回傳釋放函式；ctx 先結束時回 nil。
