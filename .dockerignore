@@ -1,0 +1,16 @@
+# 不進建置 context（.env 絕不能進映像）
+.env
+.env.*
+**/.env
+**/.env.*
+.git
+.gitignore
+.claude
+docs
+spike
+slash_commands
+slash-commands
+**/__pycache__
+**/*.pyc
+README.md
+CLAUDE.md
