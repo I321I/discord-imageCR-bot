@@ -32,12 +32,15 @@ const (
 	msgSearchPostFailed     = "貼圖失敗，請稍後再試"          // 其他上傳錯誤
 	msgSearchQueueTimeout   = "目前貼圖的人太多，請稍後再試"      // 排隊超過 MaxWait（暫定）
 	msgSearchLinkGone       = "圖床上的圖片已被刪除，無法貼出"     // 網址圖：圖床回 404／410 或內容不是圖片
-	msgSearchLinkUnverified = "目前無法確認圖片，請稍後再試"      // 網址圖：網路錯誤、逾時、被安全規則擋下等
+	msgSearchLinkUnverified = "目前無法確認圖片，請稍後再試"      // 網址圖：無法確認（403、被擋、逾時等）且 Discord 沒有圖片預覽
 )
 
 // defaultSearchMaxWait 是排隊等貼圖的預設上限：deferred 回應的 token 只有 15 分鐘，
 // 留 1 分鐘給讀訊息、下載與上傳。
 const defaultSearchMaxWait = 14 * time.Minute
+
+// defaultLinkCheckTimeout 是貼出網址圖前確認圖片還在的預設逾時（把關後決定 (d)）。
+const defaultLinkCheckTimeout = 15 * time.Second
 
 const (
 	// searchOption 是 /search 的參數名稱（Q32）。
@@ -85,8 +88,10 @@ type Search struct {
 	Access SearchAccess
 	Index  SearchIndex
 	Fetch  pipeline.Fetcher
-	// LinkCheck 在貼出網址圖前確認圖片還在；nil 時網址圖一律回「目前無法確認圖片」。
+	// LinkCheck 在貼出網址圖前確認圖片還在；nil 時視為無法確認（見 postLink）。
 	LinkCheck LinkChecker
+	// LinkCheckTimeout 是確認圖片的逾時；0 為 defaultLinkCheckTimeout。
+	LinkCheckTimeout time.Duration
 	// Ctx 是 bot 關機時才取消的 ctx：排隊等貼圖時關機就放棄；nil 時只用 handler 的 ctx。
 	Ctx context.Context
 	// MaxWait 是排隊等貼圖的上限，超過就放棄（刪除 deferred 回應、改發 ephemeral followup）；0 為 defaultSearchMaxWait。
@@ -230,7 +235,7 @@ func oneLine(s string) string {
 //     值由 client 傳來、可被偽造，所以重新檢查；否則 ephemeral「找不到這張圖片」（不區分沒權限與不存在，Q40）。
 //     值不是 Key（直接送出自己打的字）→ 貼出第一個符合的結果；沒有符合 → ephemeral「找不到符合的圖片」（Q35）。
 //  2. 回 deferred 公開回應 → 排隊（同時貼圖數有上限，排到才讀訊息與下載）→ 重新抓訊息取得最新附件網址 →
-//     下載 → 以附件重新上傳，只發圖片（Q39）。網址圖：重新抓訊息確認網址仍在 → 確認圖床上的圖片還在
+//     下載 → 以附件重新上傳，只發圖片（Q39）。網址圖：重新抓訊息確認網址仍在 → 確認圖床上的圖片沒有確定被刪除
 //     （LinkCheck）→ 貼出網址（不下載、不重新上傳；劇透時為 ||網址||；mention 不通知）。
 //  3. deferred 之後才發現錯誤：刪除 deferred 回應，改發 ephemeral followup。訊息已不存在（404）時從索引移除；
 //     附件序號越界、附件 ID 與索引不符或已不是圖片時只移除索引中該筆。
@@ -337,11 +342,20 @@ func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, entry
 	return ""
 }
 
-// postLink 貼出網址圖（已取得貼圖位置、m 為重新抓到的訊息）：網址已不在該位置 → 移除該筆、「找不到」；
-// 確認圖床上的圖片：已刪除或不是圖片 → 移除該筆、「圖床上的圖片已被刪除」；其他失敗 → 「目前無法確認圖片」；
-// 確認後以網址補上 deferred 回應（mention 不通知）。失敗時回傳要告知使用者的文字。
+// postLink 貼出網址圖（已取得貼圖位置、m 為重新抓到的訊息）：作者是 bot、webhook，或網址已不在該位置 →
+// 移除該筆、「找不到」；
+// 確認圖床上的圖片（逾時 LinkCheckTimeout）：確定已刪除（404、410、imgur removed.png）或確定不是圖片 →
+// 移除該筆、「圖床上的圖片已被刪除」；其他失敗（403、被安全規則擋下、逾時、太大等，或沒有 LinkCheck）時，
+// 只有 Discord 對這個網址產生了圖片預覽（recognize.HasImagePreview）才照樣貼出；只靠副檔名判定的回
+// 「目前無法確認圖片」、不移除索引（避免公開散播偽裝成圖片的釣魚連結，使用者決定）。
+// 以網址補上 deferred 回應（mention 不通知）。失敗時回傳要告知使用者的文字。
 func (s *Search) postLink(ctx context.Context, i *discordgo.InteractionCreate, entry index.Entry, m *discordgo.Message) string {
 	key := entry.Key
+	if m.Author == nil || m.Author.Bot || m.WebhookID != "" {
+		// 舊圖片訊息一定是一般使用者發的：作者不符視為找不到（PM 決定）。
+		s.Index.RemoveAttachment(key)
+		return msgSearchImageGone
+	}
 	var src *recognize.ImageSource
 	for _, x := range recognize.LinkSources(m) {
 		if x.Index == key.Attachment && x.URL == entry.ImageURL {
@@ -353,10 +367,11 @@ func (s *Search) postLink(ctx context.Context, i *discordgo.InteractionCreate, e
 		s.Index.RemoveAttachment(key)
 		return msgSearchImageGone
 	}
-	if s.LinkCheck == nil {
-		return msgSearchLinkUnverified
+	err := errNoLinkCheck
+	if s.LinkCheck != nil {
+		err = s.checkLink(ctx, src.FetchURL)
 	}
-	if err := s.LinkCheck.Check(ctx, src.FetchURL); err != nil {
+	if err != nil {
 		log.Printf("/search：確認 %s/%s 的網址圖 %s 失敗：%v", key.ChannelID, key.MessageID, src.FetchURL, err)
 		switch {
 		case ctx.Err() != nil:
@@ -364,14 +379,15 @@ func (s *Search) postLink(ctx context.Context, i *discordgo.InteractionCreate, e
 		case errors.Is(err, pipeline.ErrImageGone), errors.Is(err, pipeline.ErrNotImage):
 			s.Index.RemoveAttachment(key)
 			return msgSearchLinkGone
+		case !recognize.HasImagePreview(src.URL, m.Embeds):
+			return msgSearchLinkUnverified
 		}
-		return msgSearchLinkUnverified
 	}
 	content := src.URL
 	if src.Spoiler {
 		content = "||" + content + "||"
 	}
-	_, err := s.API.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+	_, err = s.API.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
 		Content:         &content,
 		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
 	})
@@ -380,6 +396,20 @@ func (s *Search) postLink(ctx context.Context, i *discordgo.InteractionCreate, e
 		return msgSearchPostFailed
 	}
 	return ""
+}
+
+// errNoLinkCheck 表示沒有設定 LinkCheck，無法確認網址圖。
+var errNoLinkCheck = errors.New("no link checker")
+
+// checkLink 以 LinkCheckTimeout 的期限確認網址上的圖片還在。
+func (s *Search) checkLink(ctx context.Context, url string) error {
+	limit := s.LinkCheckTimeout
+	if limit <= 0 {
+		limit = defaultLinkCheckTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	return s.LinkCheck.Check(ctx, url)
 }
 
 // restStatus 回傳 Discord REST 錯誤的 HTTP 狀態碼；不是 REST 錯誤時回 0。

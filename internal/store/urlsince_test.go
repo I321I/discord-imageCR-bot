@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"discordbot/internal/discordtest"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 // U1 (b)：圖片網址功能上線時間點（url_since）。
@@ -63,6 +65,8 @@ func TestURLSince_OmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// 把關後決定 (b)：url_since 用 Discord 伺服器時間——寫入儲存頻道時 Discord 回傳的訊息 snowflake ID，
+// 不用本機時鐘。先寫一次目前資料取得 ID，再寫入含 url_since 的版本。
 func TestEnsureURLSince_WritesOnceWhenMissing(t *testing.T) {
 	f := discordtest.NewFake()
 	s := New(f, storageCh)
@@ -70,53 +74,80 @@ func TestEnsureURLSince_WritesOnceWhenMissing(t *testing.T) {
 	if err := s.Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.EnsureURLSince(context.Background(), "500")
-	if err != nil || got != "500" {
-		t.Fatalf("第一次應寫入 500：%q %v", got, err)
+	got, err := s.EnsureURLSince(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := len(f.Sent); n != 1 {
-		t.Fatalf("應寫入儲存頻道一次，得到 %d", n)
+	if len(f.Sent) != 2 {
+		t.Fatalf("應寫入儲存頻道兩次（取得 ID、存回），得到 %d", len(f.Sent))
 	}
-	if s.Snapshot().URLSince != "500" {
-		t.Errorf("記憶體中應為 500：%q", s.Snapshot().URLSince)
+	msgs := f.Messages(storageCh)
+	firstID := msgs[len(msgs)-2].ID // 第一次寫入的訊息
+	if got != firstID {
+		t.Errorf("url_since 應為 Discord 回傳的訊息 ID %s，得到 %q", firstID, got)
 	}
-	// 重新讀取儲存頻道仍是 500，且原設定保留。
+	if s.Snapshot().URLSince != got {
+		t.Errorf("記憶體中應為 %s：%q", got, s.Snapshot().URLSince)
+	}
 	s2 := New(f, storageCh)
 	if err := s2.Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if d := s2.Snapshot(); d.URLSince != "500" || len(d.Guilds) != 2 {
+	if d := s2.Snapshot(); d.URLSince != got || len(d.Guilds) != 2 {
 		t.Errorf("存回的資料不正確：%+v", d)
 	}
 
 	// 已有值：不改、不寫入。
-	got, err = s.EnsureURLSince(context.Background(), "900")
-	if err != nil || got != "500" {
-		t.Fatalf("已有值時應回原值 500：%q %v", got, err)
+	again, err := s.EnsureURLSince(context.Background())
+	if err != nil || again != got {
+		t.Fatalf("已有值時應回原值：%q %v", again, err)
 	}
-	if n := len(f.Sent); n != 1 {
-		t.Errorf("已有值時不應寫入，寫入次數 %d", n)
+	if len(f.Sent) != 2 {
+		t.Errorf("已有值時不應寫入，寫入次數 %d", len(f.Sent))
 	}
 }
 
 func TestEnsureURLSince_WriteFailureKeepsEmpty(t *testing.T) {
-	f := discordtest.NewFake()
-	s := New(f, storageCh)
-	if err := s.Load(context.Background()); err != nil {
-		t.Fatal(err)
+	for _, failAt := range []int{1, 2} {
+		f := discordtest.NewFake()
+		s := New(f, storageCh)
+		addEncoded(t, f, sampleData(), "1")
+		if err := s.Load(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		api := &failNthStoreSend{Fake: f, n: failAt}
+		s.api = api
+		if _, err := s.EnsureURLSince(context.Background()); !errors.Is(err, discordtest.ErrInjected) {
+			t.Fatalf("第 %d 次寫入失敗應回錯誤：%v", failAt, err)
+		}
+		if s.Snapshot().URLSince != "" || len(s.Snapshot().Guilds) != 2 {
+			t.Errorf("第 %d 次寫入失敗時記憶體不應改變：%+v", failAt, s.Snapshot())
+		}
+		// 儲存頻道中最新的完整版本仍是原設定（沒有 url_since）。
+		s2 := New(f, storageCh)
+		if err := s2.Load(context.Background()); err != nil || len(s2.Snapshot().Guilds) != 2 || s2.Snapshot().URLSince != "" {
+			t.Errorf("第 %d 次寫入失敗後儲存頻道應保留原設定：%+v %v", failAt, s2.Snapshot(), err)
+		}
 	}
-	f.FailOn["ChannelMessageSendComplex"] = discordtest.ErrInjected
-	if _, err := s.EnsureURLSince(context.Background(), "500"); !errors.Is(err, discordtest.ErrInjected) {
-		t.Fatalf("寫入失敗應回錯誤：%v", err)
+}
+
+// failNthStoreSend 在第 n 次發送訊息時回錯誤。
+type failNthStoreSend struct {
+	*discordtest.Fake
+	calls, n int
+}
+
+func (f *failNthStoreSend) ChannelMessageSendComplex(channelID string, data *discordgo.MessageSend, options ...discordgo.RequestOption) (*discordgo.Message, error) {
+	f.calls++
+	if f.calls == f.n {
+		return nil, discordtest.ErrInjected
 	}
-	if s.Snapshot().URLSince != "" {
-		t.Errorf("寫入失敗時記憶體不應改變：%q", s.Snapshot().URLSince)
-	}
+	return f.Fake.ChannelMessageSendComplex(channelID, data, options...)
 }
 
 func TestEnsureURLSince_NotLoaded(t *testing.T) {
 	s := New(discordtest.NewFake(), storageCh)
-	if _, err := s.EnsureURLSince(context.Background(), "500"); !errors.Is(err, ErrNotLoaded) {
+	if _, err := s.EnsureURLSince(context.Background()); !errors.Is(err, ErrNotLoaded) {
 		t.Errorf("尚未載入應回 ErrNotLoaded：%v", err)
 	}
 }

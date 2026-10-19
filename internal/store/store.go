@@ -121,15 +121,15 @@ func (s *Store) Save(ctx context.Context) error {
 	if !s.loaded {
 		return ErrNotLoaded
 	}
-	if err := s.save(ctx, s.data); err != nil {
+	if _, err := s.save(ctx, s.data); err != nil {
 		return err
 	}
 	s.generation++
 	return nil
 }
 
-// save 呼叫者必須持有 writeMu。
-func (s *Store) save(ctx context.Context, d *Data) error {
+// save 呼叫者必須持有 writeMu。回傳第一則寫入的訊息 ID（Discord 產生的 snowflake）。
+func (s *Store) save(ctx context.Context, d *Data) (firstID string, err error) {
 	v := s.now().UnixNano()
 	if v <= s.lastVersion {
 		v = s.lastVersion + 1
@@ -137,14 +137,18 @@ func (s *Store) save(ctx context.Context, d *Data) error {
 	s.lastVersion = v
 	contents, err := Encode(d, strconv.FormatInt(v, 10))
 	if err != nil {
-		return err
+		return "", err
 	}
-	for _, c := range contents {
-		if _, err := s.api.ChannelMessageSendComplex(s.channelID, &discordgo.MessageSend{Content: c}, discordgo.WithContext(ctx)); err != nil {
-			return err
+	for i, c := range contents {
+		m, err := s.api.ChannelMessageSendComplex(s.channelID, &discordgo.MessageSend{Content: c}, discordgo.WithContext(ctx))
+		if err != nil {
+			return "", err
+		}
+		if i == 0 && m != nil {
+			firstID = m.ID
 		}
 	}
-	return nil
+	return firstID, nil
 }
 
 // Update 修改資料的複本並寫入儲存頻道，成功後才替換目前資料；fn 或寫入失敗時記憶體中的資料不變。
@@ -161,7 +165,7 @@ func (s *Store) Update(ctx context.Context, fn func(d *Data) error) error {
 	if err := fn(c); err != nil {
 		return err
 	}
-	if err := s.save(ctx, c); err != nil {
+	if _, err := s.save(ctx, c); err != nil {
 		return err
 	}
 	s.replace(c)
@@ -175,23 +179,31 @@ func (s *Store) Snapshot() *Data {
 	return s.data.Clone()
 }
 
-// errURLSinceSet 表示 URLSince 已有值，EnsureURLSince 不寫入。
-var errURLSinceSet = errors.New("url_since already set")
-
-// EnsureURLSince 在資料沒有圖片網址功能上線時間點時設為 at 並寫入儲存頻道，回傳目前的值；
-// 已有值時不寫入，回傳原值。寫入失敗時記憶體中的資料不變（回錯誤）。
-func (s *Store) EnsureURLSince(ctx context.Context, at string) (string, error) {
-	err := s.Update(ctx, func(d *Data) error {
-		if d.URLSince != "" {
-			return errURLSinceSet
-		}
-		d.URLSince = at
-		return nil
-	})
-	switch {
-	case errors.Is(err, errURLSinceSet):
-	case err != nil:
+// EnsureURLSince 在資料沒有圖片網址功能上線時間點時設定並寫入儲存頻道，回傳目前的值；已有值時不寫入，回傳原值。
+// 時間點用 Discord 伺服器時間，不用本機時鐘（Pi 沒有 RTC，開機時鐘可能落後，把關後決定 (b)）：
+// 先把目前資料寫成新版本，以 Discord 回傳的第一則訊息 ID（snowflake）作為時間點，再寫入含時間點的版本。
+// 第一次寫入的內容與目前資料相同，所以任一次寫入失敗時，記憶體與儲存頻道中最新的完整版本都仍是原資料（回錯誤）。
+func (s *Store) EnsureURLSince(ctx context.Context) (string, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if !s.loaded {
+		return "", ErrNotLoaded
+	}
+	if s.data.URLSince != "" {
+		return s.data.URLSince, nil
+	}
+	c := s.data.Clone()
+	id, err := s.save(ctx, c)
+	if err != nil {
 		return "", err
 	}
-	return s.Snapshot().URLSince, nil
+	if id == "" {
+		return "", errors.New("寫入儲存頻道後沒有取得訊息 ID")
+	}
+	c.URLSince = id
+	if _, err := s.save(ctx, c); err != nil {
+		return "", err
+	}
+	s.replace(c)
+	return id, nil
 }

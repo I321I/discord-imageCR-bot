@@ -27,9 +27,9 @@ const (
 	reactionFailed     = "❌"
 )
 
-// errNoImages 表示訊息中沒有要處理的圖片（例如補處理重讀後網址被編輯掉、附件被移除）：
-// 不發、不刪原訊息、不加 ❌。
-var errNoImages = errors.New("message has no images to process")
+// ErrNoImages 表示訊息中沒有要處理的圖片（例如補處理重讀後網址被編輯掉、附件被移除、只剩 gifv）：
+// 不發、不刪原訊息、不加 ❌。只有 Reprocess 會收到這個錯誤，其他排入方式回 nil。
+var ErrNoImages = errors.New("message has no images to process")
 
 // HandleMessage 判斷新訊息是否要自動處理，要的話呼叫 Process（錯誤只記 log）。
 // 只處理一般使用者（不含 bot、webhook，Q50）在來源頻道發的、有圖片（圖片附件或圖片網址，不含 gifv，U3）
@@ -163,7 +163,7 @@ type sourceFile struct {
 func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Message) error {
 	srcs, ok := recognize.NewMessageSources(m)
 	if !ok || len(srcs) == 0 {
-		return errNoImages
+		return ErrNoImages
 	}
 	files := make([]sourceFile, len(srcs))
 	for i, src := range srcs {

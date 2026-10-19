@@ -52,7 +52,7 @@ type linkEnv struct {
 func newLinkEnv(t *testing.T) *linkEnv {
 	t.Helper()
 	e := newEnv(t)
-	if _, err := e.p.Store.EnsureURLSince(context.Background(), "1"); err != nil {
+	if err := e.p.Store.Update(context.Background(), func(d *store.Data) error { d.URLSince = "1"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	e.fake.Sent = nil
@@ -504,5 +504,27 @@ func TestReprocess_LinkMessage(t *testing.T) {
 	}
 	if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) || !e.originalExists(m) {
 		t.Errorf("失敗應保留原訊息並重新加 ❌：%q", got)
+	}
+}
+
+// 使用者決定（2026-10-19 把關後）：帶 ❌ 但只剩 gifv 的訊息重新處理 → 回 ErrNoImages（可辨識），不發、不刪。
+// 一般佇列與補處理遇到沒有圖片仍回 nil。
+func TestReprocess_GIFVOnly_ErrNoImages(t *testing.T) {
+	e := newLinkEnv(t)
+	const g = "https://tenor.com/view/x"
+	m := e.linkMessage("動圖 "+g, &discordgo.MessageEmbed{Type: discordgo.EmbedTypeGifv, URL: g})
+	m.Reactions = failedReaction()
+	err := <-e.p.Reprocess(context.Background(), testGuild, m)
+	if !errors.Is(err, ErrNoImages) {
+		t.Fatalf("應回 ErrNoImages：%v", err)
+	}
+	if len(e.fake.Sent) != 0 || !e.originalExists(m) {
+		t.Error("不應發出或刪除")
+	}
+	if got := e.fake.ReactionsOn(testSource, m.ID); slices.Contains(got, "⏳") {
+		t.Errorf("應移除 ⏳：%q", got)
+	}
+	if err := <-e.p.Enqueue(context.Background(), testGuild, m); err != nil {
+		t.Errorf("一般佇列沒有圖片應回 nil：%v", err)
 	}
 }

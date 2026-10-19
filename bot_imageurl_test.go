@@ -22,11 +22,11 @@ func waitScan(t *testing.T, r *recordScanner) {
 	}
 }
 
-// U1 (b)：第一次啟動（沒有 url_since）以收到 READY 的時間寫入並存回，掃描用寫入後的設定。
+// U1 (b)：第一次啟動（沒有 url_since）寫入並存回，掃描用寫入後的設定。
+// 把關後決定 (b)：值為寫入儲存頻道時 Discord 回傳的訊息 ID（伺服器時間），不用本機時鐘。
 func TestOnReady_WritesURLSinceBeforeScan(t *testing.T) {
 	f, st := newLoadedStore(t, "g", "c1")
 	sent := len(f.Sent)
-	before := time.Now()
 	r := &recordScanner{done: make(chan struct{}, 1)}
 	onReady(r, st, true)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g"}}})
 	waitScan(t, r)
@@ -36,13 +36,16 @@ func TestOnReady_WritesURLSinceBeforeScan(t *testing.T) {
 	if !snowflake.Valid(got) {
 		t.Fatalf("掃描用的設定應有 url_since：%q", got)
 	}
-	if snowflake.Less(got, snowflake.FromTime(before.Add(-time.Second))) || snowflake.Less(snowflake.FromTime(time.Now().Add(time.Second)), got) {
-		t.Errorf("url_since 應為收到 READY 的時間：%s", got)
+	ids := map[string]bool{}
+	for _, m := range f.Messages("storage") {
+		ids[m.ID] = true
 	}
-	if len(f.Sent) != sent+1 {
-		t.Errorf("應寫入儲存頻道一次，得到 %d 次", len(f.Sent)-sent)
+	if !ids[got] {
+		t.Errorf("url_since 應為儲存頻道中 Discord 回傳的訊息 ID：%s", got)
 	}
-	// 重新讀取儲存頻道仍有 url_since。
+	if len(f.Sent) != sent+2 {
+		t.Errorf("應寫入儲存頻道兩次（取得 ID、存回），得到 %d 次", len(f.Sent)-sent)
+	}
 	st2 := store.New(f, "storage")
 	if err := st2.Load(context.Background()); err != nil || st2.Snapshot().URLSince != got {
 		t.Errorf("應存回儲存頻道：%q %v", st2.Snapshot().URLSince, err)
@@ -52,7 +55,7 @@ func TestOnReady_WritesURLSinceBeforeScan(t *testing.T) {
 // 已有 url_since（之後的 READY、重新 IDENTIFY）：不改、不寫入。
 func TestOnReady_KeepsExistingURLSince(t *testing.T) {
 	f, st := newLoadedStore(t, "g", "c1")
-	if _, err := st.EnsureURLSince(context.Background(), "12345"); err != nil {
+	if err := st.Update(context.Background(), func(d *store.Data) error { d.URLSince = "12345"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	sent := len(f.Sent)

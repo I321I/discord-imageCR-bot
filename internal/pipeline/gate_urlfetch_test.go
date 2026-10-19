@@ -34,7 +34,7 @@ func TestGate_CheckPublicAddr_MoreBlocked(t *testing.T) {
 	}
 }
 
-// 把關（記錄用）：嵌入 IPv4 的 IPv6 過渡位址。這些目前放行，列出結果供評估（不讓測試失敗）。
+// 把關：嵌入 IPv4 的 IPv6 過渡位址。原本只記錄結果；PM 決定 (a)（2026-10-19 把關後）改為封鎖，斷言被擋。
 func TestGate_CheckPublicAddr_TransitionAddrsReport(t *testing.T) {
 	for _, s := range []string{
 		"[::127.0.0.1]:443",      // IPv4-compatible（已廢止）
@@ -46,8 +46,9 @@ func TestGate_CheckPublicAddr_TransitionAddrsReport(t *testing.T) {
 		"[fec0::1]:443",          // site-local（已廢止）
 		"[100::1]:443",           // discard-only
 	} {
-		err := CheckPublicAddr(netip.MustParseAddrPort(s))
-		t.Logf("%-26s → %v", s, err)
+		if err := CheckPublicAddr(netip.MustParseAddrPort(s)); !errors.Is(err, ErrBlockedAddress) {
+			t.Errorf("%s 應被擋：%v", s, err)
+		}
 	}
 }
 
@@ -175,6 +176,8 @@ func TestGate_URLCheck_SniffAndNoFullRead(t *testing.T) {
 	var wrote atomic.Int64
 	big, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
+		// 第二輪把關後決定：Check 以內容嗅探確認是 PNG／JPEG／GIF／WEBP，所以開頭要是 PNG 簽章（原本全為 0）。
+		w.Write([]byte("\x89PNG\r\n\x1a\n"))
 		chunk := make([]byte, 64<<10)
 		for i := 0; i < 1024; i++ { // 64MiB
 			n, err := w.Write(chunk)

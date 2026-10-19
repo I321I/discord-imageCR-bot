@@ -130,6 +130,49 @@ type Hooks struct {
 	// putMu 讓「確認仍是來源頻道再寫入」與 ChannelRemoved 的清除互斥：
 	// 設定先移除頻道才呼叫 ChannelRemoved，所以寫入要嘛在清除之前（會被清掉），要嘛看得到頻道已移除。
 	putMu sync.Mutex
+
+	// refetchMu 保護 refetching：MessageUpdated 處理中（含重讀）的訊息（"channelID/messageID" → 進行中的處理）。
+	// 訊息在重讀期間被刪除時標記，寫回前檢查，避免把已刪除的訊息寫回索引（把關後決定 (c)）。
+	// 鎖順序：putMu → refetchMu。
+	refetchMu  sync.Mutex
+	refetching map[string][]*refetchToken
+}
+
+// refetchToken 是一次進行中的重讀；deleted 由 refetchMu 保護。
+type refetchToken struct{ deleted bool }
+
+func refetchKey(channelID, messageID string) string { return channelID + "/" + messageID }
+
+// startRefetch 登記一次重讀，回傳登記與取消登記的函式。
+func (h *Hooks) startRefetch(channelID, messageID string) (*refetchToken, func()) {
+	k := refetchKey(channelID, messageID)
+	tok := &refetchToken{}
+	h.refetchMu.Lock()
+	if h.refetching == nil {
+		h.refetching = map[string][]*refetchToken{}
+	}
+	h.refetching[k] = append(h.refetching[k], tok)
+	h.refetchMu.Unlock()
+	return tok, func() {
+		h.refetchMu.Lock()
+		defer h.refetchMu.Unlock()
+		toks := slices.DeleteFunc(h.refetching[k], func(t *refetchToken) bool { return t == tok })
+		if len(toks) == 0 {
+			delete(h.refetching, k)
+		} else {
+			h.refetching[k] = toks
+		}
+	}
+}
+
+// removeMessage 移除訊息的索引項目，並標記該訊息進行中的重讀（結果不寫回）。
+func (h *Hooks) removeMessage(channelID, messageID string) {
+	h.refetchMu.Lock()
+	defer h.refetchMu.Unlock()
+	for _, t := range h.refetching[refetchKey(channelID, messageID)] {
+		t.deleted = true
+	}
+	h.x.RemoveMessage(channelID, messageID)
 }
 
 // shutdownBackfiller 把補處理排入佇列時改用 bot 關機 ctx：掃描用的 ctx 在掃描結束時就會取消，
@@ -303,15 +346,15 @@ func (h *Hooks) stopScan(channelID string) bool {
 	return true
 }
 
-// MessageDeleted 移除被刪除訊息的索引項目。
+// MessageDeleted 移除被刪除訊息的索引項目（進行中的重讀結果不再寫回）。
 func (h *Hooks) MessageDeleted(channelID, messageID string) {
-	h.x.RemoveMessage(channelID, messageID)
+	h.removeMessage(channelID, messageID)
 }
 
-// MessagesDeleted 移除批次刪除的訊息的索引項目。
+// MessagesDeleted 移除批次刪除的訊息的索引項目（進行中的重讀結果不再寫回）。
 func (h *Hooks) MessagesDeleted(channelID string, messageIDs []string) {
 	for _, id := range messageIDs {
-		h.x.RemoveMessage(channelID, id)
+		h.removeMessage(channelID, id)
 	}
 }
 
@@ -325,7 +368,7 @@ type messageGetter interface {
 // 設定時間點不合法時，使用者訊息一律視為舊圖片訊息（同掃描）。
 // 其他訊息（含新訊息：等待處理或處理失敗的原訊息）不動。
 // 使用者訊息的更新是部分的（Attachments 或 Embeds 為 nil）時，在 putMu 之外重讀完整訊息再判斷：
-// 404 → 移除；其他錯誤 → 記 log、不動。
+// 404 → 移除；其他錯誤 → 記 log、不動。處理期間（含重讀、完整更新）收到該訊息的刪除事件 → 不寫回。
 // 寫入在 putMu 下重新確認頻道仍是來源（同 PutImageMessage）。
 func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	if m == nil || m.Author == nil {
@@ -347,6 +390,9 @@ func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	if !ok || store.IsNewMessage(m.ID, setAt, d.URLSince, true) {
 		return // 不是來源頻道，或不論有沒有附件都是新訊息
 	}
+	// 登記處理中（含不需重讀的完整更新）：處理途中收到刪除事件時不寫回。
+	tok, done := h.startRefetch(m.ChannelID, m.ID)
+	defer done()
 	if m.Attachments == nil || m.Embeds == nil {
 		getter, ok := h.api.(messageGetter)
 		if !ok {
@@ -369,6 +415,12 @@ func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	d = h.store.Snapshot()
 	guildID, setAt, ok := d.SourceChannel(m.ChannelID)
 	if !ok || store.IsNewMessage(m.ID, setAt, d.URLSince, len(m.Attachments) == 0) {
+		return
+	}
+	// 處理期間（含重讀）訊息被刪除就不寫回；檢查與寫入在 refetchMu 內，與 MessageDeleted 互斥。
+	h.refetchMu.Lock()
+	defer h.refetchMu.Unlock()
+	if tok.deleted {
 		return
 	}
 	h.x.RemoveMessage(m.ChannelID, m.ID)

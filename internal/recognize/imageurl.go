@@ -270,6 +270,24 @@ func sameURL(a, b string) bool {
 	return ua.String() == ub.String()
 }
 
+// HasImagePreview 回傳 Discord 是否對 raw 產生了圖片預覽：type image／gifv 的預覽，其 URL、image 或 thumbnail
+// 就是 raw（皆以 sameURL 比對）。只靠副檔名判定的圖片網址不算；其他類型（article／link 的 og:image 由網頁指定、
+// rich 由 bot／webhook 自訂）不算。
+func HasImagePreview(raw string, embeds []*discordgo.MessageEmbed) bool {
+	for _, e := range embeds {
+		if e == nil || e.Type == discordgo.EmbedTypeRich {
+			continue
+		}
+		if e.Type != discordgo.EmbedTypeImage && e.Type != discordgo.EmbedTypeGifv {
+			continue // article／link 的 og:image 是網頁自己指定的，rich 是 bot 自訂的，都不算
+		}
+		if sameURL(e.URL, raw) || (e.Image != nil && sameURL(e.Image.URL, raw)) || (e.Thumbnail != nil && sameURL(e.Thumbnail.URL, raw)) {
+			return true
+		}
+	}
+	return false
+}
+
 // embedFor 回傳是否有任何預覽屬於 raw（URL、image 或 thumbnail 相同）。
 func embedFor(raw string, embeds []*discordgo.MessageEmbed) bool {
 	for _, e := range embeds {

@@ -82,7 +82,7 @@ func TestScan_NoURLSince_LinkMessagesLegacy(t *testing.T) {
 func TestHooks_ScanUsesURLSince(t *testing.T) {
 	f, st, x, bf, h := newHooksEnv(t)
 	addSource(t, st, "g", "c", "200")
-	if _, err := st.EnsureURLSince(context.Background(), "300"); err != nil {
+	if err := st.Update(context.Background(), func(d *store.Data) error { d.URLSince = "300"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	addUserLink(f, "c", "250", example2)
@@ -100,7 +100,7 @@ func hooksWithURLSince(t *testing.T) (*discordtest.Fake, *Index, *Hooks) {
 	t.Helper()
 	f, st, x, _, h := newHooksEnv(t)
 	addSource(t, st, "g", "c", "200")
-	if _, err := st.EnsureURLSince(context.Background(), "300"); err != nil {
+	if err := st.Update(context.Background(), func(d *store.Data) error { d.URLSince = "300"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return f, x, h
@@ -221,5 +221,75 @@ func removeSource(t *testing.T, st *store.Store, guildID, channelID string) {
 	t.Helper()
 	if err := st.Update(context.Background(), func(d *store.Data) error { d.RemoveChannel(guildID, channelID); return nil }); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 把關後決定 (c)：批次刪除也算；刪除的是別則訊息時照常寫回。
+func TestMessageUpdated_RefetchRacesBulkDelete(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		del    func(h *Hooks)
+		remain int
+	}{
+		{"批次刪除同一則", func(h *Hooks) { h.MessagesDeleted("c", []string{"99", "100"}) }, 0},
+		{"刪除別則", func(h *Hooks) { h.MessageDeleted("c", "101") }, 1},
+	} {
+		f := discordtest.NewFake()
+		g := &gatedAPI{Fake: f, fetched: make(chan struct{}), release: make(chan struct{})}
+		st := store.New(f, "storage")
+		st.UseEmpty()
+		x := New()
+		h := NewHooks(context.Background(), g, x, &fakeBackfill{}, st)
+		addSource(t, st, "g", "c", "200")
+		addUserLink(f, "c", "100", "新文字\n"+example1URL)
+		done := make(chan struct{})
+		go func() {
+			h.MessageUpdated(&discordgo.Message{ID: "100", ChannelID: "c", Content: "新文字\n" + example1URL, Author: &discordgo.User{ID: "u1"}})
+			close(done)
+		}()
+		<-g.fetched
+		c.del(h)
+		close(g.release)
+		<-done
+		if es := x.Search("", allow("c"), 0); len(es) != c.remain {
+			t.Errorf("%s：剩 %d 筆，預期 %d", c.name, len(es), c.remain)
+		}
+		// 之後同一則訊息的更新不受先前刪除記錄影響（不殘留記錄）。
+		h.refetchMu.Lock()
+		n := len(h.refetching)
+		h.refetchMu.Unlock()
+		if n != 0 {
+			t.Errorf("%s：重讀記錄應清除：%d", c.name, n)
+		}
+	}
+}
+
+// PM 決定（第二輪把關後）：完整的更新（不需重讀）處理途中收到刪除事件 → 不寫回。
+func TestMessageUpdated_FullUpdateRacesDelete(t *testing.T) {
+	_, st, x, _, h := newHooksEnv(t)
+	addSource(t, st, "g", "c", "200")
+	h.putMu.Lock() // 讓 MessageUpdated 停在寫入前
+	done := make(chan struct{})
+	m := linkMsg("c", "100", example1)
+	m.Attachments, m.Embeds = []*discordgo.MessageAttachment{}, []*discordgo.MessageEmbed{}
+	go func() {
+		h.MessageUpdated(m)
+		close(done)
+	}()
+	waitCond(t, "登記處理中", func() bool {
+		h.refetchMu.Lock()
+		defer h.refetchMu.Unlock()
+		return len(h.refetching) == 1
+	})
+	h.MessageDeleted("c", "100")
+	h.putMu.Unlock()
+	<-done
+	if es := x.Search("", allow("c"), 0); len(es) != 0 {
+		t.Errorf("處理途中被刪除不應寫回：%+v", es)
+	}
+	h.refetchMu.Lock()
+	defer h.refetchMu.Unlock()
+	if len(h.refetching) != 0 {
+		t.Errorf("登記應清除：%d", len(h.refetching))
 	}
 }

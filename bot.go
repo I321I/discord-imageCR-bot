@@ -18,7 +18,6 @@ import (
 	"discordbot/internal/index"
 	"discordbot/internal/pipeline"
 	"discordbot/internal/recognize"
-	"discordbot/internal/snowflake"
 	"discordbot/internal/store"
 
 	"github.com/bwmarrin/discordgo"
@@ -229,7 +228,8 @@ type readyScanner interface {
 }
 
 // onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景先確定圖片網址功能上線時間點、清除，再掃描所有來源頻道。
-// 上線時間點（U1）：ensureURLSince（設定已成功讀取）且設定中還沒有時，以收到 READY 的時間寫入並存回；
+// 上線時間點（U1）：ensureURLSince（設定已成功讀取）且設定中還沒有時寫入並存回，值為寫入儲存頻道時
+// Discord 回傳的訊息 ID（伺服器時間，不用本機時鐘，把關後決定 (b)）；
 // 寫入失敗只記 log（只含圖片網址的訊息當舊圖片訊息）。設定讀取失敗、以空資料啟動時不寫入，
 // 避免自動以空資料蓋掉儲存頻道中的設定。
 // 清除：比對 READY 中 bot 所在的伺服器（暫時無法使用的也算仍在），移除已不在的伺服器的來源頻道（離線期間被踢出的殘留，
@@ -250,7 +250,7 @@ func onReady(h readyScanner, st *store.Store, ensureURLSince bool) func(*discord
 		}
 		go func() {
 			if ensureURLSince {
-				if at, err := st.EnsureURLSince(context.Background(), snowflake.FromTime(receivedAt)); err != nil {
+				if at, err := st.EnsureURLSince(context.Background()); err != nil {
 					log.Printf("寫入圖片網址功能上線時間點失敗，只含圖片網址的訊息暫時當舊圖片訊息：%v", err)
 				} else {
 					log.Printf("圖片網址功能上線時間點：%s", at)

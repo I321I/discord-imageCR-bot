@@ -136,22 +136,130 @@ func TestSearchSubmit_LinkEntry_ImageGone(t *testing.T) {
 	}
 }
 
-func TestSearchSubmit_LinkEntry_CannotVerify(t *testing.T) {
-	for _, err := range []error{errors.New("timeout"), pipeline.ErrBlockedAddress, pipeline.ErrTooLarge} {
+// linkLegacyWithEmbeds 同 linkLegacy，訊息帶 embeds。
+func (e *srEnv) linkLegacyWithEmbeds(ch, content string, embeds ...*discordgo.MessageEmbed) *discordgo.Message {
+	m := e.fake.AddMessage(&discordgo.Message{ChannelID: ch, Author: &discordgo.User{ID: "someone"}, Content: content, Embeds: embeds})
+	e.x.PutLegacy(srGuild, m)
+	return m
+}
+
+// 使用者決定（2026-10-19 把關後）：只有確定已刪除或確定不是圖片才擋下並移除索引；
+// 其他錯誤（403、被擋、逾時、太大等）只有在 Discord 對這個網址產生了圖片預覽時才照樣貼出，
+// 只靠副檔名判定的回「目前無法確認圖片」、不移除索引（避免散播偽裝成 .jpg 的釣魚連結）。
+func TestSearchSubmit_LinkEntry_UncertainStillPosts(t *testing.T) {
+	errs := []error{errors.New("HTTP 403"), errors.New("timeout"), context.DeadlineExceeded, pipeline.ErrBlockedAddress, pipeline.ErrTooLarge, pipeline.ErrUnconfirmedImage}
+	// (b) 有 image 預覽、Check 失敗 → 貼出。
+	for _, err := range errs {
 		e, lc := newLinkSREnv(t)
-		m := e.linkLegacy(srChannel, srExample1)
+		m := e.linkLegacyWithEmbeds(srChannel, srExample1, &discordgo.MessageEmbed{Type: discordgo.EmbedTypeImage, URL: srExample1URL})
 		lc.errs[srExample1URL] = err
 		e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
-		failedAfterDefer(t, e.fake, msgSearchLinkUnverified)
+		if ed := posted(t, e.fake); ed.Edit.Content == nil || *ed.Edit.Content != srExample1URL {
+			t.Errorf("%v：有圖片預覽時應照樣貼出：%v", err, ed.Edit.Content)
+		}
 		if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Link: true}); !ok {
-			t.Errorf("%v：無法確認時不應移除索引", err)
+			t.Errorf("%v：不應移除索引", err)
 		}
 	}
-	// 沒有設定檢查器：無法確認。
+	// image 型預覽的 thumbnail 就是這個網址也算圖片預覽（article 的縮圖不算，見 UncertainWithoutPreview）。
+	{
+		e, lc := newLinkSREnv(t)
+		m := e.linkLegacyWithEmbeds(srChannel, srExample1, &discordgo.MessageEmbed{Type: discordgo.EmbedTypeImage, URL: "https://other.com", Thumbnail: &discordgo.MessageEmbedThumbnail{URL: srExample1URL}})
+		lc.errs[srExample1URL] = errors.New("HTTP 403")
+		e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+		if ed := posted(t, e.fake); ed.Edit.Content == nil || *ed.Edit.Content != srExample1URL {
+			t.Errorf("thumbnail 對應此網址時應貼出：%v", ed.Edit.Content)
+		}
+	}
+}
+
+func TestSearchSubmit_LinkEntry_UncertainWithoutPreview(t *testing.T) {
+	cases := []struct {
+		name   string
+		embeds []*discordgo.MessageEmbed
+	}{
+		{"(a) 只有副檔名、沒有預覽", nil},
+		{"(c) 預覽是 article", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeArticle, URL: srExample1URL, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: "https://phish.example/logo.png"}}}},
+		{"(c) 預覽是 link", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeLink, URL: srExample1URL}}},
+		// PM 決定（第三輪把關後）：article 的縮圖（網頁 og:image）就是這個網址也不算。
+		{"article 的縮圖是此網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeArticle, URL: "https://phish.example/", Thumbnail: &discordgo.MessageEmbedThumbnail{URL: srExample1URL}}}},
+	}
+	for _, c := range cases {
+		e, lc := newLinkSREnv(t)
+		m := e.linkLegacyWithEmbeds(srChannel, srExample1, c.embeds...)
+		lc.errs[srExample1URL] = errors.New("HTTP 403")
+		e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+		failedAfterDefer(t, e.fake, msgSearchLinkUnverified)
+		for _, ed := range e.fake.ResponseEdits {
+			if ed.Edit.Content != nil && strings.Contains(*ed.Edit.Content, "imgur") {
+				t.Errorf("%s：不應貼出網址", c.name)
+			}
+		}
+		if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Link: true}); !ok {
+			t.Errorf("%s：不應移除索引", c.name)
+		}
+	}
+	// 沒有設定檢查器：等同無法確認，套用同一規則。
 	e := newSREnv(t)
 	m := e.linkLegacy(srChannel, srExample1)
 	e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
 	failedAfterDefer(t, e.fake, msgSearchLinkUnverified)
+	e = newSREnv(t)
+	m = e.linkLegacyWithEmbeds(srChannel, srExample1, &discordgo.MessageEmbed{Type: discordgo.EmbedTypeImage, URL: srExample1URL})
+	e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+	if ed := posted(t, e.fake); ed.Edit.Content == nil || *ed.Edit.Content != srExample1URL {
+		t.Errorf("沒有檢查器、有圖片預覽時應貼出：%v", ed.Edit.Content)
+	}
+}
+
+// 把關後決定 (d)：確認圖片使用 15 秒逾時；逾時視為無法確認，照樣貼出。
+func TestSearchSubmit_LinkCheckTimeout(t *testing.T) {
+	if defaultLinkCheckTimeout != 15*time.Second {
+		t.Errorf("預設逾時 %v，預期 15 秒", defaultLinkCheckTimeout)
+	}
+	e := newSREnv(t)
+	dc := &deadlineCheck{}
+	e.s.LinkCheck = dc
+	start := time.Now()
+	m := e.linkLegacy(srChannel, srExample1)
+	e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+	if dl, ok := dc.deadline(); !ok || dl.Sub(start) > 15*time.Second+time.Second || dl.Sub(start) < 14*time.Second {
+		t.Errorf("Check 應有約 15 秒的期限：%v %v", dl.Sub(start), ok)
+	}
+	// 實際逾時（縮短期限）：有圖片預覽時照樣貼出。
+	e = newSREnv(t)
+	e.s.LinkCheck = &deadlineCheck{wait: true}
+	e.s.LinkCheckTimeout = 20 * time.Millisecond
+	m = e.linkLegacyWithEmbeds(srChannel, srExample1, &discordgo.MessageEmbed{Type: discordgo.EmbedTypeImage, URL: srExample1URL})
+	e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+	if ed := posted(t, e.fake); ed.Edit.Content == nil || *ed.Edit.Content != srExample1URL {
+		t.Errorf("逾時後應照樣貼出：%v", ed.Edit.Content)
+	}
+}
+
+// deadlineCheck 記錄 Check 收到的 ctx 期限；wait 時等到 ctx 結束才回傳。
+type deadlineCheck struct {
+	mu   sync.Mutex
+	dl   time.Time
+	ok   bool
+	wait bool
+}
+
+func (c *deadlineCheck) Check(ctx context.Context, url string) error {
+	c.mu.Lock()
+	c.dl, c.ok = ctx.Deadline()
+	c.mu.Unlock()
+	if c.wait {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (c *deadlineCheck) deadline() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dl, c.ok
 }
 
 // 把關重點 4：網址已不在該位置 → 找不到並移除該筆。
@@ -283,4 +391,49 @@ func TestRerecognize_FailedLinkOriginalReprocesses(t *testing.T) {
 		t.Fatalf("應重新處理整則：%v", e.pipe.reproc)
 	}
 	deferred(t, e.fake, msgReprocessed)
+}
+
+// 使用者決定（2026-10-19 把關後）：帶 ❌ 但只剩 gifv 的訊息「重新辨識」→「這則訊息沒有可處理的圖片」。
+func TestRerecognize_FailedOriginalNoImages(t *testing.T) {
+	e := newCMEnv(t)
+	m := failedOriginal(e, cmUser, true)
+	e.pipe.reprocErr = fmt.Errorf("包裝：%w", pipeline.ErrNoImages)
+	e.c.Rerecognize(context.Background(), menu(CmdRerecognize, cmUser, m))
+	deferred(t, e.fake, msgNoImages)
+	if msgNoImages != "這則訊息沒有可處理的圖片" {
+		t.Errorf("文字：%q", msgNoImages)
+	}
+}
+
+// 第二輪把關後：Check 回「無法確認是點陣圖」（例如 SVG）且沒有 Discord 圖片預覽 → 無法確認、不移除索引。
+func TestSearchSubmit_LinkEntry_UnconfirmedRasterNoPreview(t *testing.T) {
+	e, lc := newLinkSREnv(t)
+	m := e.linkLegacy(srChannel, srExample1)
+	lc.errs[srExample1URL] = fmt.Errorf("包裝：%w", pipeline.ErrUnconfirmedImage)
+	e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+	failedAfterDefer(t, e.fake, msgSearchLinkUnverified)
+	if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Link: true}); !ok {
+		t.Error("不應移除索引")
+	}
+}
+
+// PM 決定（第二輪把關後）：重讀到的訊息作者是 bot 或 webhook → 視為找不到、不連外、不貼出。
+func TestSearchSubmit_LinkEntry_BotOrWebhookAuthor(t *testing.T) {
+	for _, mod := range []func(m *discordgo.Message){
+		func(m *discordgo.Message) { m.Author = &discordgo.User{ID: "otherbot", Bot: true} },
+		func(m *discordgo.Message) { m.WebhookID = "wh" },
+		func(m *discordgo.Message) { m.Author = nil },
+	} {
+		e, lc := newLinkSREnv(t)
+		m := e.linkLegacy(srChannel, srExample1)
+		mod(m) // Fake 中的訊息與 m 共用
+		e.s.Submit(context.Background(), searchSubmit(srUser, linkKey(m, 0)))
+		failedAfterDefer(t, e.fake, msgSearchImageGone)
+		if len(lc.checked()) != 0 {
+			t.Error("不應連外檢查")
+		}
+		if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID, Link: true}); ok {
+			t.Error("應移除該筆")
+		}
+	}
 }

@@ -37,6 +37,7 @@ const (
 	msgPermissionUnknown = "目前無法確認權限，請稍後再試"
 	msgRestarting        = "機器人正在重新啟動，請稍後再試"
 	msgNotSource         = "這個頻道已不是圖庫頻道"
+	msgNoImages          = "這則訊息沒有可處理的圖片" // 帶 ❌ 但只剩 gifv 等新訊息不處理的內容（使用者決定）
 )
 
 const (
@@ -572,6 +573,9 @@ func (c *ContextMenu) reprocessOriginal(ctx context.Context, i *discordgo.Intera
 	case err == nil:
 	case errors.Is(err, pipeline.ErrAlreadyQueued):
 		editResponse(c.API, i, msgAlreadyQueued)
+		return
+	case errors.Is(err, pipeline.ErrNoImages):
+		editResponse(c.API, i, msgNoImages)
 		return
 	case errors.Is(err, pipeline.ErrNotSource):
 		// 排隊期間頻道已不是來源（原訊息不補回 ❌）。

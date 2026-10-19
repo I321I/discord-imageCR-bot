@@ -299,3 +299,33 @@ func TestNewMessageSources_ExcludesGIFV(t *testing.T) {
 		t.Errorf("gifv 網址應留在文字中：%q", got)
 	}
 }
+
+// HasImagePreview：Discord 對這個網址產生了圖片預覽（只靠副檔名不算）。
+func TestHasImagePreview(t *testing.T) {
+	const u = "https://a.com/x.jpg"
+	cases := []struct {
+		name   string
+		embeds []*discordgo.MessageEmbed
+		want   bool
+	}{
+		{"沒有預覽", nil, false},
+		{"image 且 URL 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u}}, true},
+		{"gifv 且 URL 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeGifv, URL: u}}, true},
+		// PM 決定（第三輪把關後）：image／thumbnail 比對只看 type image／gifv 的預覽；article／link 的 og:image 是網頁自己指定的，不算。
+		{"article 的 thumbnail 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeArticle, URL: "https://o.com", Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u}}}, false},
+		{"link 的 image 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeLink, Image: &discordgo.MessageEmbedImage{URL: u}}}, false},
+		{"image 型、URL 不同但 thumbnail 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: "https://o.com/p", Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u}}}, true},
+		{"gifv 型、image 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeGifv, URL: "https://o.com/v", Image: &discordgo.MessageEmbedImage{URL: u}}}, true},
+		// PM 決定（第二輪把關後）：rich embed 是 bot／webhook 自訂的內容，不算 Discord 產生的預覽。
+		{"rich 的 image 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeRich, Image: &discordgo.MessageEmbedImage{URL: u}}}, false},
+		{"rich 的 thumbnail 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeRich, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u}}}, false},
+		{"article 且 URL 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeArticle, URL: u}}, false},
+		{"link 且 URL 相同", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeLink, URL: u}}, false},
+		{"image 但屬於別的網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: "https://a.com/y.jpg"}}, false},
+	}
+	for _, c := range cases {
+		if got := HasImagePreview(u, c.embeds); got != c.want {
+			t.Errorf("%s：HasImagePreview = %v，預期 %v", c.name, got, c.want)
+		}
+	}
+}

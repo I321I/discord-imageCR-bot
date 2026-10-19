@@ -51,8 +51,8 @@ func (g *gatedAPI) ChannelMessage(channelID, messageID string, options ...discor
 	return m, err
 }
 
-// 把關重點 6（記錄）：部分更新在 putMu 外重讀，重讀途中訊息被刪除（MessageDeleted 先完成）時，
-// 重讀結果仍會寫回索引，留下已刪除訊息的項目。/search 選到時重讀 404 會移除（自我修復），所以只記錄結果。
+// 把關重點 6：部分更新在 putMu 外重讀，重讀途中訊息被刪除（MessageDeleted 先完成）時，重讀結果不可寫回索引。
+// 原本只記錄結果；把關後決定 (c) 改為斷言沒有殘留。
 func TestGate_MessageUpdated_RefetchRacesDelete(t *testing.T) {
 	f := discordtest.NewFake()
 	g := &gatedAPI{Fake: f, fetched: make(chan struct{}), release: make(chan struct{})}
@@ -62,7 +62,7 @@ func TestGate_MessageUpdated_RefetchRacesDelete(t *testing.T) {
 	h := NewHooks(context.Background(), g, x, &fakeBackfill{}, st)
 	h.SetBotID(botID)
 	addSource(t, st, "g", "c", "200")
-	if _, err := st.EnsureURLSince(context.Background(), "300"); err != nil {
+	if err := st.Update(context.Background(), func(d *store.Data) error { d.URLSince = "300"; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	x.PutLegacy("g", linkMsg("c", "100", example1))
@@ -77,6 +77,7 @@ func TestGate_MessageUpdated_RefetchRacesDelete(t *testing.T) {
 	h.MessageDeleted("c", "100")
 	close(g.release)
 	<-done
-	es := x.Search("", allow("c"), 0)
-	t.Logf("重讀途中訊息被刪除後，索引剩 %d 筆（0 為無殘留）", len(es))
+	if es := x.Search("", allow("c"), 0); len(es) != 0 {
+		t.Errorf("重讀途中訊息被刪除後不應寫回：%+v", es)
+	}
 }

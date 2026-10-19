@@ -339,6 +339,7 @@ func TestURLCheck(t *testing.T) {
 		switch r.URL.Path {
 		case "/png":
 			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("\x89PNG\r\n\x1a\n"))
 			chunk := make([]byte, 1<<20)
 			for i := 0; i < 20; i++ {
 				m, err := w.Write(chunk)
@@ -425,5 +426,135 @@ func TestURLFetch_RedirectToRemovedImage(t *testing.T) {
 	}
 	if err := f.Check(context.Background(), srv.URL+"/abc.jpg"); !errors.Is(err, ErrImageGone) {
 		t.Errorf("Check 應回 ErrImageGone：%v", err)
+	}
+}
+
+// PM 決定 (a)：IPv6 過渡位址整段封鎖（含包公開 IPv4 的），一般公開 IPv6 照常放行。
+func TestCheckPublicAddr_IPv6TransitionPrefixes(t *testing.T) {
+	blocked := []string{
+		"[::8.8.8.8]:443", "[::ffff:0:808:808]:443", "[2002:808:808::1]:443", "[2001::1]:443",
+		"[2001:0:ffff::1]:443", "[64:ff9b:1::808:808]:443", "[fec0::1]:443", "[feff::1]:443", "[100::]:443", "[100::ffff:ffff:ffff:ffff]:443",
+	}
+	for _, s := range blocked {
+		if err := CheckPublicAddr(netip.MustParseAddrPort(s)); !errors.Is(err, ErrBlockedAddress) {
+			t.Errorf("%s 應被擋：%v", s, err)
+		}
+	}
+	for _, s := range []string{"[2001:4860:4860::8888]:443", "[2001:1::1]:443", "[100:0:0:1::]:443", "[::ffff:8.8.8.8]:443", "[2003::1]:443"} {
+		if err := CheckPublicAddr(netip.MustParseAddrPort(s)); err != nil {
+			t.Errorf("%s 應放行：%v", s, err)
+		}
+	}
+}
+
+// 第二輪把關後決定：Check 只對內容是 PNG／JPEG／GIF／WEBP 的回 nil；其他（SVG、PDF、宣稱 image/* 但內容不是）
+// 回一般錯誤（「無法確認」，不是 ErrImageGone／ErrNotImage）；octet-stream／沒有 Content-Type 而內容是文字仍為 ErrNotImage。
+func TestURLCheck_OnlyRasterFormats(t *testing.T) {
+	gif := []byte("GIF89a\x01\x00\x01\x00")
+	jpg := []byte("\xff\xd8\xff\xe0\x00\x10JFIF")
+	webp := []byte("RIFF\x00\x00\x00\x00WEBPVP8 ")
+	svg := []byte(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`)
+	cases := []struct {
+		name, ct string
+		body     []byte
+		ok       bool
+		want     error // ok 為 false 時：nil 表示一般錯誤
+	}{
+		{"gif", "image/gif", gif, true, nil},
+		{"jpeg（沒有 Content-Type）", "", jpg, true, nil},
+		{"webp（octet-stream）", "application/octet-stream", webp, true, nil},
+		{"Content-Type 寫錯但內容是 PNG", "image/jpeg", []byte("\x89PNG\r\n\x1a\n"), true, nil},
+		{"svg", "image/svg+xml", svg, false, nil},
+		{"bmp", "image/bmp", []byte("BM\x3a\x00\x00\x00"), false, nil},
+		{"宣稱 png 但內容是網頁", "image/png", []byte("<!DOCTYPE html><html></html>"), false, nil},
+		// 第三輪把關後使用者決定 (b)：octet-stream 的 SVG 為「無法確認」（原本是 ErrNotImage）。
+		{"octet-stream 的 svg", "application/octet-stream", svg, false, nil},
+		{"空內容", "image/png", nil, false, nil},
+	}
+	for _, c := range cases {
+		srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if c.ct == "" {
+				w.Header()["Content-Type"] = nil
+			} else {
+				w.Header().Set("Content-Type", c.ct)
+			}
+			w.Write(c.body)
+		})
+		err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/x.jpg")
+		switch {
+		case c.ok && err != nil:
+			t.Errorf("%s：應確認成功：%v", c.name, err)
+		case !c.ok && err == nil:
+			t.Errorf("%s：不應確認成功", c.name)
+		case !c.ok && c.want != nil && !errors.Is(err, c.want):
+			t.Errorf("%s：應為 %v：%v", c.name, c.want, err)
+		case !c.ok && c.want == nil && (errors.Is(err, ErrNotImage) || errors.Is(err, ErrImageGone)):
+			t.Errorf("%s：應為一般錯誤（無法確認），得到 %v", c.name, err)
+		}
+	}
+}
+
+// 第三輪把關後 PM 決定：Content-Type 標頭有多個值（Go 取第一個、瀏覽器取最後一個）或無法解析時不可確認。
+// 有任一值是圖片類（image/*、octet-stream）→ ErrUnconfirmedImage（不移除索引）；全部都不是 → ErrNotImage。
+// 新訊息下載（Fetch）套用同樣的判斷（失敗即不處理）。
+func TestURLCheck_ContentTypeHeaderValues(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n")
+	cases := []struct {
+		name string
+		cts  []string
+		want error
+	}{
+		{"image 後接 text/html", []string{"image/gif", "text/html"}, ErrUnconfirmedImage},
+		{"text/html 後接 image", []string{"text/html", "image/png"}, ErrUnconfirmedImage},
+		{"兩個相同的 image/png", []string{"image/png", "image/png"}, ErrUnconfirmedImage},
+		{"octet-stream 與 text/plain", []string{"application/octet-stream", "text/plain"}, ErrUnconfirmedImage},
+		{"兩個都是網頁", []string{"text/html", "application/xhtml+xml"}, ErrNotImage},
+		{"單一標頭以逗號列出", []string{"image/png, text/html"}, ErrUnconfirmedImage},
+		{"無法解析", []string{"image/png; ="}, ErrUnconfirmedImage},
+	}
+	for _, c := range cases {
+		srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header()["Content-Type"] = c.cts
+			w.Write(png)
+		})
+		f := newURLFetcher(allowOnly(srv))
+		if err := f.Check(context.Background(), srv.URL+"/a.png"); !errors.Is(err, c.want) {
+			t.Errorf("Check %s：%v，預期 %v", c.name, err, c.want)
+		}
+		if _, err := f.Fetch(context.Background(), srv.URL+"/a.png"); err == nil {
+			t.Errorf("Fetch %s：不應下載成功", c.name)
+		}
+	}
+}
+
+// 第三輪把關後使用者決定 (b)：octet-stream／沒有 Content-Type 時，內容是 SVG（可有 BOM、前導空白、XML 宣告）→ 無法確認；
+// 其他文字（HTML、純文字、不含 <svg 的 XML）→ ErrNotImage。
+func TestURLCheck_SVGDetection(t *testing.T) {
+	cases := []struct {
+		name, body string
+		want       error
+	}{
+		{"BOM＋空白＋<svg", "\xef\xbb\xbf  \n<svg xmlns=\"http://www.w3.org/2000/svg\"/>", ErrUnconfirmedImage},
+		{"XML 宣告＋註解＋<svg", "<?xml version=\"1.0\"?>\n<!-- x -->\n<svg/>", ErrUnconfirmedImage},
+		{"大寫 <SVG", "<SVG></SVG>", ErrUnconfirmedImage},
+		{"HTML", "<!DOCTYPE html><html><body>removed</body></html>", ErrNotImage},
+		{"HTML 中嵌 svg", "<html><body><svg/></body></html>", ErrNotImage},
+		{"不含 svg 的 XML", "<?xml version=\"1.0\"?><rss></rss>", ErrNotImage},
+		{"純文字", "image removed", ErrNotImage},
+	}
+	for _, c := range cases {
+		for _, ct := range []string{"application/octet-stream", ""} {
+			srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if ct == "" {
+					w.Header()["Content-Type"] = nil
+				} else {
+					w.Header().Set("Content-Type", ct)
+				}
+				w.Write([]byte(c.body))
+			})
+			if err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.svg"); !errors.Is(err, c.want) {
+				t.Errorf("%s（Content-Type %q）：%v，預期 %v", c.name, ct, err, c.want)
+			}
+		}
 	}
 }

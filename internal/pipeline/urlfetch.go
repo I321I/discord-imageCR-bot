@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 var (
@@ -42,6 +43,14 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"), // 含 255.255.255.255
 	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("2001:db8::/32"),
+	// IPv6 過渡位址（內嵌 IPv4，可能繞過 IPv4 檢查；PM 決定整段封鎖）。
+	netip.MustParsePrefix("::/96"),           // IPv4-compatible（已廢止）
+	netip.MustParsePrefix("::ffff:0:0:0/96"), // IPv4-translated
+	netip.MustParsePrefix("2002::/16"),       // 6to4
+	netip.MustParsePrefix("2001::/32"),       // Teredo
+	netip.MustParsePrefix("64:ff9b:1::/48"),  // 本地 NAT64
+	netip.MustParsePrefix("fec0::/10"),       // site-local（已廢止）
+	netip.MustParsePrefix("100::/64"),        // discard-only
 }
 
 // CheckPublicAddr 回傳 ap 是否可連線：只允許公開位址的 80、443 連接埠；不可時回包含 ErrBlockedAddress 的錯誤。
@@ -130,7 +139,7 @@ func checkWebURL(u *url.URL) error {
 	return nil
 }
 
-// get 送出 GET 並檢查狀態碼與 Content-Type；成功時呼叫者負責關閉 body。
+// get 送出 GET 並檢查狀態碼與 Content-Type（全部值，見 contentType）；成功時呼叫者負責關閉 body。
 // 404、410，或最終網址為已刪除圖片的替代圖（imgur removed.png）→ ErrImageGone；其他非 200 → 錯誤；Content-Type 有值且不是 image/*、也不是 application/octet-stream → ErrNotImage。
 func (f *URLFetcher) get(ctx context.Context, rawURL string) (*http.Response, error) {
 	u, err := url.Parse(rawURL)
@@ -160,14 +169,52 @@ func (f *URLFetcher) get(ctx context.Context, rawURL string) (*http.Response, er
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w：轉址到 %s", ErrImageGone, resp.Request.URL)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		mediaType, _, _ := mime.ParseMediaType(ct)
-		if !strings.HasPrefix(mediaType, "image/") && mediaType != "application/octet-stream" {
-			resp.Body.Close()
-			return nil, fmt.Errorf("%w：Content-Type %s", ErrNotImage, ct)
-		}
+	if _, err := contentType(resp.Header.Values("Content-Type")); err != nil {
+		resp.Body.Close()
+		return nil, err
 	}
 	return resp, nil
+}
+
+// isImageLikeType 回傳媒體類型是否可能是圖片（image/* 或 application/octet-stream）。
+func isImageLikeType(mediaType string) bool {
+	return strings.HasPrefix(mediaType, "image/") || mediaType == "application/octet-stream"
+}
+
+// contentType 檢查回應的所有 Content-Type 值，回傳唯一的媒體類型（沒有 Content-Type 時為空字串）。
+// 只有一個值（單一標頭、沒有以逗號列出多個）且能解析時才採用：不是圖片類 → ErrNotImage。
+// 多個值（Go 取第一個、瀏覽器取最後一個，可用來繞過檢查）或無法解析時不確定瀏覽器會怎麼開：
+// 任一值是圖片類或無法解析 → ErrUnconfirmedImage（不當成已刪除）；全部是非圖片類 → ErrNotImage。
+func contentType(values []string) (string, error) {
+	var types []string
+	for _, v := range values {
+		for _, t := range strings.Split(v, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				types = append(types, t)
+			}
+		}
+	}
+	if len(types) == 0 {
+		return "", nil
+	}
+	imageLike, unparsable := false, false
+	var mediaType string
+	for _, t := range types {
+		mt, _, err := mime.ParseMediaType(t)
+		if err != nil {
+			unparsable = true
+			continue
+		}
+		mediaType = mt
+		imageLike = imageLike || isImageLikeType(mt)
+	}
+	switch {
+	case len(types) == 1 && !unparsable && imageLike:
+		return mediaType, nil
+	case !imageLike && !unparsable:
+		return "", fmt.Errorf("%w：Content-Type %q", ErrNotImage, types)
+	}
+	return "", fmt.Errorf("%w：Content-Type %q 不只一個或無法解析", ErrUnconfirmedImage, types)
 }
 
 // Fetch 下載 rawURL：Content-Length 超過上限時不讀 body，回 ErrTooLarge；內容超過上限也回 ErrTooLarge。
@@ -191,24 +238,51 @@ func (f *URLFetcher) Fetch(ctx context.Context, rawURL string) ([]byte, error) {
 	return data, nil
 }
 
-// Check 確認 rawURL 上的圖片還在（/search 貼網址前）：只讀回應標頭，Content-Type 不明時再讀少量內容判斷。
-// 404、410 → ErrImageGone；不是圖片（Content-Type 或內容是網頁／文字）→ ErrNotImage；其他失敗回一般錯誤。
+// rasterSniffTypes 是 Check 視為「確定是圖片」的內容嗅探結果（http.DetectContentType）：與辨識支援的格式相同。
+var rasterSniffTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// ErrUnconfirmedImage 表示無法確認網址的內容是 PNG／JPEG／GIF／WEBP（例如 SVG、PDF，或宣稱是圖片但內容不符）：
+// 不是「確定已刪除」也不是「確定不是圖片」，/search 歸為無法確認。
+var ErrUnconfirmedImage = errors.New("content is not a confirmed raster image")
+
+// looksLikeSVG 回傳內容開頭（去掉 BOM 與前導空白）是否為 SVG：以 <svg 開頭，或以 <?xml 開頭且含 <svg（不分大小寫）。
+func looksLikeSVG(head []byte) bool {
+	t := strings.TrimLeftFunc(strings.TrimPrefix(string(head), "\ufeff"), unicode.IsSpace)
+	lower := strings.ToLower(t)
+	return strings.HasPrefix(lower, "<svg") || (strings.HasPrefix(lower, "<?xml") && strings.Contains(lower, "<svg"))
+}
+
+// Check 確認 rawURL 上的圖片還在（/search 貼網址前）：讀回應標頭與前 512 bytes（不讀完整內容），以內容嗅探判斷格式，
+// 不只信 Content-Type。
+//   - 404、410、轉址到 imgur removed.png → ErrImageGone；
+//   - Content-Type 不是圖片（網頁等），或 Content-Type 為 octet-stream／沒有而內容是 SVG 以外的文字 → ErrNotImage；
+//   - Content-Type 有多個值或無法解析（見 contentType）→ ErrUnconfirmedImage，或全部為非圖片類時 ErrNotImage；
+//   - 內容是 PNG／JPEG／GIF／WEBP → nil；
+//   - 其他（SVG、BMP、PDF、宣稱 image/* 但內容不符等）→ ErrUnconfirmedImage（一般錯誤，無法確認）；
+//   - 其他失敗回一般錯誤。
 func (f *URLFetcher) Check(ctx context.Context, rawURL string) error {
 	resp, err := f.get(ctx, rawURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if strings.HasPrefix(mediaType, "image/") {
-		return nil
-	}
 	head, err := io.ReadAll(io.LimitReader(resp.Body, urlSniffBytes))
 	if err != nil {
 		return fmt.Errorf("讀取網址內容失敗：%w", err)
 	}
-	if strings.HasPrefix(http.DetectContentType(head), "text/") {
-		return fmt.Errorf("%w：內容是 %s", ErrNotImage, http.DetectContentType(head))
+	sniffed, _, _ := strings.Cut(http.DetectContentType(head), ";")
+	if rasterSniffTypes[sniffed] {
+		return nil
 	}
-	return nil
+	// get 已確認 Content-Type 只有一個值（圖片類）或沒有。
+	mediaType, _ := contentType(resp.Header.Values("Content-Type"))
+	if !strings.HasPrefix(mediaType, "image/") && strings.HasPrefix(sniffed, "text/") && !looksLikeSVG(head) {
+		return fmt.Errorf("%w：內容是 %s", ErrNotImage, sniffed)
+	}
+	return fmt.Errorf("%w：Content-Type %q，內容是 %s", ErrUnconfirmedImage, mediaType, sniffed)
 }
