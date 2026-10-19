@@ -49,8 +49,12 @@ func TestGateR5_URLCheck_NonUTF8FilenameStar(t *testing.T) {
 		w.Header().Set("Content-Disposition", `attachment; filename="a.gif"; filename*=iso-8859-1''a.html`)
 		w.Write([]byte("GIF89a\x01\x00\x01\x00\x00\x00\x00;"))
 	})
+	// 原本只記錄（Go 不支援 iso-8859-1 的 filename*，會略過它而採用 filename="a.gif"）；
+	// 最後一條決定：含 filename* 但無法解析時，不論 filename 是什麼都歸為無法確認，改為斷言。
 	err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.gif")
-	t.Logf("filename*=iso-8859-1''a.html：Check = %v", err)
+	if !errors.Is(err, ErrUnconfirmedImage) {
+		t.Errorf("filename*=iso-8859-1''a.html：應為 ErrUnconfirmedImage，得到 %v", err)
+	}
 }
 
 // Refresh 搭配網頁內容：仍為 ErrNotImage（get 先擋，確定不是圖片）。

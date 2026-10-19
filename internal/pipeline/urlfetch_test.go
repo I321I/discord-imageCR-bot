@@ -630,3 +630,40 @@ func TestURLFetch_IgnoresRefreshAndDisposition(t *testing.T) {
 		t.Errorf("Fetch 應照常下載：%q %v", data, err)
 	}
 }
+
+// 最後一條決定：(1) Content-Disposition 含 filename* 但無法解析（非 UTF-8／US-ASCII 字元集、編碼錯誤、續行格式）→ 無法確認，
+// 不論 filename 是什麼；(2) disposition 類型不是 inline 的任何值依 RFC 6266 視為 attachment，套用檔名規則。
+func TestURLCheck_DispositionEdgeCases(t *testing.T) {
+	gifBody := []byte("GIF89a\x01\x00\x01\x00\x00\x00\x00;")
+	cases := []struct {
+		cd string
+		ok bool
+	}{
+		{`x-attachment; filename=a.html`, false},
+		{`x-attachment`, false},
+		{`foo; filename="a.exe"`, false},
+		{`x-attachment; filename=a.png`, true},
+		{`INLINE`, true},
+		{`inline; filename="a.html"`, true}, // inline 照常顯示，不看檔名
+		{`inline; filename*=iso-8859-1''a.png`, false},
+		{`attachment; filename*=UTF-8''%ZZ.png`, false},
+		{`attachment; filename*=a.png`, false}, // 缺少字元集與語言
+		{`attachment; filename*0*=UTF-8''a; filename*1=.png`, false},
+		{`attachment; filename*=UTF-8''a.png`, true},
+		{`attachment; FILENAME*=us-ascii'en'a.gif`, true},
+	}
+	for _, c := range cases {
+		srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/gif")
+			w.Header().Set("Content-Disposition", c.cd)
+			w.Write(gifBody)
+		})
+		err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.gif")
+		switch {
+		case c.ok && err != nil:
+			t.Errorf("%q：應確認成功：%v", c.cd, err)
+		case !c.ok && !errors.Is(err, ErrUnconfirmedImage):
+			t.Errorf("%q：應為 ErrUnconfirmedImage：%v", c.cd, err)
+		}
+	}
+}

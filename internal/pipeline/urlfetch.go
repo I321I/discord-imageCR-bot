@@ -254,8 +254,10 @@ var ErrUnconfirmedImage = errors.New("content is not a confirmed raster image")
 
 // checkPageHeaders 檢查會讓瀏覽器不把回應當成圖片顯示、或讓內容嗅探失準的標頭（/search 的 Check 用）：
 //   - Refresh（任何值）：瀏覽器可能轉到其他頁面（使用者決定）；
-//   - Content-Disposition attachment，且檔名（filename／filename*）不是 .png/.jpg/.jpeg/.gif/.webp（使用者決定）；
-//     無法解析的 attachment 也算；
+//   - Content-Disposition 不是 inline（attachment、x-attachment、不認得的值，依 RFC 6266 都視為 attachment），
+//     且檔名（filename／filename*）不是 .png/.jpg/.jpeg/.gif/.webp，或無法解析（使用者決定）；
+//   - Content-Disposition 含 filename* 但無法解析（非 UTF-8／US-ASCII 字元集、編碼錯誤、續行格式），不論 filename 是什麼
+//     （Go 會略過無法解析的 filename* 而改用 filename，與瀏覽器不同）；
 //   - Content-Encoding 不是 identity，且 Transport 沒有自動解壓（內容嗅探看到的是壓縮資料，PM 決定）。
 //
 // 符合時回 ErrUnconfirmedImage。
@@ -264,15 +266,19 @@ func checkPageHeaders(resp *http.Response) error {
 		return fmt.Errorf("%w：回應帶 Refresh 標頭", ErrUnconfirmedImage)
 	}
 	for _, v := range resp.Header.Values("Content-Disposition") {
-		disposition, params, err := mime.ParseMediaType(v)
-		if err != nil {
-			if strings.Contains(strings.ToLower(v), "attachment") {
-				return fmt.Errorf("%w：無法解析的 Content-Disposition %q", ErrUnconfirmedImage, v)
-			}
-			continue
+		if !validFilenameStar(v) {
+			return fmt.Errorf("%w：無法解析的 Content-Disposition filename* %q", ErrUnconfirmedImage, v)
 		}
-		if disposition == "attachment" && !imageFileExts[strings.ToLower(path.Ext(params["filename"]))] {
-			return fmt.Errorf("%w：Content-Disposition attachment 檔名 %q", ErrUnconfirmedImage, params["filename"])
+		disposition, params, err := mime.ParseMediaType(v)
+		if disposition == "inline" {
+			continue // inline 照常顯示，不看檔名（filename* 已在上面檢查）
+		}
+		if err != nil {
+			return fmt.Errorf("%w：無法解析的 Content-Disposition %q", ErrUnconfirmedImage, v)
+		}
+		// 不是 inline 的類型（attachment、x-attachment、不認得的值）依 RFC 6266 都視為 attachment。
+		if !imageFileExts[strings.ToLower(path.Ext(params["filename"]))] {
+			return fmt.Errorf("%w：Content-Disposition %s 檔名 %q", ErrUnconfirmedImage, disposition, params["filename"])
 		}
 	}
 	if !resp.Uncompressed {
@@ -283,6 +289,33 @@ func checkPageHeaders(resp *http.Response) error {
 		}
 	}
 	return nil
+}
+
+// validFilenameStar 回傳 Content-Disposition 值中的 filename* 參數（若有）是否能確定解析：
+// 只接受單一 filename*（不接受 filename*0 等續行），格式為「字元集'語言'百分比編碼」，字元集為 UTF-8 或 US-ASCII，
+// 且百分比編碼正確。沒有 filename* 時回 true。
+func validFilenameStar(v string) bool {
+	for _, seg := range strings.Split(v, ";") {
+		name, value, _ := strings.Cut(seg, "=")
+		name = strings.ToLower(strings.TrimSpace(name))
+		if !strings.HasPrefix(name, "filename*") {
+			continue
+		}
+		if name != "filename*" {
+			return false
+		}
+		parts := strings.SplitN(strings.TrimSpace(value), "'", 3)
+		if len(parts) != 3 {
+			return false
+		}
+		if cs := strings.ToLower(parts[0]); cs != "utf-8" && cs != "us-ascii" {
+			return false
+		}
+		if _, err := url.PathUnescape(parts[2]); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // imageFileExts 是 Content-Disposition attachment 檔名可接受的圖片副檔名。
