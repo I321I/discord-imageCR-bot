@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"path"
 	"strings"
 	"syscall"
 	"time"
@@ -141,7 +142,8 @@ func checkWebURL(u *url.URL) error {
 
 // get 送出 GET 並檢查狀態碼與 Content-Type（全部值，見 contentType）；成功時呼叫者負責關閉 body。
 // 404、410，或最終網址為已刪除圖片的替代圖（imgur removed.png）→ ErrImageGone；其他非 200 → 錯誤；Content-Type 有值且不是 image/*、也不是 application/octet-stream → ErrNotImage。
-func (f *URLFetcher) get(ctx context.Context, rawURL string) (*http.Response, error) {
+// allowUnconfirmed 時 Content-Type 為「無法確認」（ErrUnconfirmedImage）仍回傳回應（Fetch：交給後續解碼判斷）。
+func (f *URLFetcher) get(ctx context.Context, rawURL string, allowUnconfirmed bool) (*http.Response, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("網址不合法：%w", err)
@@ -169,7 +171,7 @@ func (f *URLFetcher) get(ctx context.Context, rawURL string) (*http.Response, er
 		resp.Body.Close()
 		return nil, fmt.Errorf("%w：轉址到 %s", ErrImageGone, resp.Request.URL)
 	}
-	if _, err := contentType(resp.Header.Values("Content-Type")); err != nil {
+	if _, err := contentType(resp.Header.Values("Content-Type")); err != nil && !(allowUnconfirmed && errors.Is(err, ErrUnconfirmedImage)) {
 		resp.Body.Close()
 		return nil, err
 	}
@@ -217,10 +219,10 @@ func contentType(values []string) (string, error) {
 	return "", fmt.Errorf("%w：Content-Type %q 不只一個或無法解析", ErrUnconfirmedImage, types)
 }
 
-// Fetch 下載 rawURL：Content-Length 超過上限時不讀 body，回 ErrTooLarge；內容超過上限也回 ErrTooLarge。
-// 是否能解碼成支援的圖片格式由呼叫端檢查。
+// Fetch 下載 rawURL（新訊息重新上傳用）：Content-Length 超過上限時不讀 body，回 ErrTooLarge；內容超過上限也回 ErrTooLarge。
+// Content-Type 為「無法確認」（多個值、無法解析）時仍下載，是否能解碼成支援的圖片格式由呼叫端檢查（解碼失敗即不處理）。
 func (f *URLFetcher) Fetch(ctx context.Context, rawURL string) ([]byte, error) {
-	resp, err := f.get(ctx, rawURL)
+	resp, err := f.get(ctx, rawURL, true)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +252,42 @@ var rasterSniffTypes = map[string]bool{
 // 不是「確定已刪除」也不是「確定不是圖片」，/search 歸為無法確認。
 var ErrUnconfirmedImage = errors.New("content is not a confirmed raster image")
 
+// checkPageHeaders 檢查會讓瀏覽器不把回應當成圖片顯示、或讓內容嗅探失準的標頭（/search 的 Check 用）：
+//   - Refresh（任何值）：瀏覽器可能轉到其他頁面（使用者決定）；
+//   - Content-Disposition attachment，且檔名（filename／filename*）不是 .png/.jpg/.jpeg/.gif/.webp（使用者決定）；
+//     無法解析的 attachment 也算；
+//   - Content-Encoding 不是 identity，且 Transport 沒有自動解壓（內容嗅探看到的是壓縮資料，PM 決定）。
+//
+// 符合時回 ErrUnconfirmedImage。
+func checkPageHeaders(resp *http.Response) error {
+	if len(resp.Header.Values("Refresh")) > 0 {
+		return fmt.Errorf("%w：回應帶 Refresh 標頭", ErrUnconfirmedImage)
+	}
+	for _, v := range resp.Header.Values("Content-Disposition") {
+		disposition, params, err := mime.ParseMediaType(v)
+		if err != nil {
+			if strings.Contains(strings.ToLower(v), "attachment") {
+				return fmt.Errorf("%w：無法解析的 Content-Disposition %q", ErrUnconfirmedImage, v)
+			}
+			continue
+		}
+		if disposition == "attachment" && !imageFileExts[strings.ToLower(path.Ext(params["filename"]))] {
+			return fmt.Errorf("%w：Content-Disposition attachment 檔名 %q", ErrUnconfirmedImage, params["filename"])
+		}
+	}
+	if !resp.Uncompressed {
+		for _, v := range resp.Header.Values("Content-Encoding") {
+			if enc := strings.TrimSpace(v); enc != "" && !strings.EqualFold(enc, "identity") {
+				return fmt.Errorf("%w：Content-Encoding %q", ErrUnconfirmedImage, v)
+			}
+		}
+	}
+	return nil
+}
+
+// imageFileExts 是 Content-Disposition attachment 檔名可接受的圖片副檔名。
+var imageFileExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true}
+
 // looksLikeSVG 回傳內容開頭（去掉 BOM 與前導空白）是否為 SVG：以 <svg 開頭，或以 <?xml 開頭且含 <svg（不分大小寫）。
 func looksLikeSVG(head []byte) bool {
 	t := strings.TrimLeftFunc(strings.TrimPrefix(string(head), "\ufeff"), unicode.IsSpace)
@@ -266,11 +304,14 @@ func looksLikeSVG(head []byte) bool {
 //   - 其他（SVG、BMP、PDF、宣稱 image/* 但內容不符等）→ ErrUnconfirmedImage（一般錯誤，無法確認）；
 //   - 其他失敗回一般錯誤。
 func (f *URLFetcher) Check(ctx context.Context, rawURL string) error {
-	resp, err := f.get(ctx, rawURL)
+	resp, err := f.get(ctx, rawURL, false)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if err := checkPageHeaders(resp); err != nil {
+		return err
+	}
 	head, err := io.ReadAll(io.LimitReader(resp.Body, urlSniffBytes))
 	if err != nil {
 		return fmt.Errorf("讀取網址內容失敗：%w", err)

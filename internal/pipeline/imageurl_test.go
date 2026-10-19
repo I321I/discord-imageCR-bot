@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -526,5 +527,40 @@ func TestReprocess_GIFVOnly_ErrNoImages(t *testing.T) {
 	}
 	if err := <-e.p.Enqueue(context.Background(), testGuild, m); err != nil {
 		t.Errorf("一般佇列沒有圖片應回 nil：%v", err)
+	}
+}
+
+// 最後一輪把關後 PM 決定：Content-Type 有多個值（無法確認）時新訊息仍下載，交給解碼判斷：
+// 是真的圖片 → 照常處理；解碼失敗 → 下載失敗、加 ❌。
+func TestProcess_URLFetcher_UnconfirmedContentTypeDecodes(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		body func(t *testing.T) []byte
+		ok   bool
+	}{
+		{"真的 PNG", func(t *testing.T) []byte { return pngBytes(t, 8, 8) }, true},
+		{"不是圖片", func(t *testing.T) []byte { return []byte("<html>phish</html>") }, false},
+	} {
+		body := c.body(t)
+		srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header()["Content-Type"] = []string{"image/png", "text/html"}
+			w.Write(body)
+		})
+		e := newLinkEnv(t)
+		e.p.URLFetch = newURLFetcher(allowOnly(srv))
+		m := e.linkMessage(srv.URL + "/x.png 文字")
+		err := e.p.Process(context.Background(), testGuild, m)
+		if c.ok {
+			if err != nil || len(e.fake.Sent) != 1 || e.originalExists(m) {
+				t.Errorf("%s：應處理：%v Sent %d", c.name, err, len(e.fake.Sent))
+			}
+			continue
+		}
+		if !errors.Is(err, ErrNotImage) || len(e.fake.Sent) != 0 || !e.originalExists(m) {
+			t.Errorf("%s：應下載失敗並保留原訊息：%v Sent %d", c.name, err, len(e.fake.Sent))
+		}
+		if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) {
+			t.Errorf("%s：應加 ❌：%q", c.name, got)
+		}
 	}
 }

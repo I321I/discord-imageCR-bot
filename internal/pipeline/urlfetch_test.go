@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -496,7 +498,6 @@ func TestURLCheck_OnlyRasterFormats(t *testing.T) {
 
 // 第三輪把關後 PM 決定：Content-Type 標頭有多個值（Go 取第一個、瀏覽器取最後一個）或無法解析時不可確認。
 // 有任一值是圖片類（image/*、octet-stream）→ ErrUnconfirmedImage（不移除索引）；全部都不是 → ErrNotImage。
-// 新訊息下載（Fetch）套用同樣的判斷（失敗即不處理）。
 func TestURLCheck_ContentTypeHeaderValues(t *testing.T) {
 	png := []byte("\x89PNG\r\n\x1a\n")
 	cases := []struct {
@@ -521,8 +522,13 @@ func TestURLCheck_ContentTypeHeaderValues(t *testing.T) {
 		if err := f.Check(context.Background(), srv.URL+"/a.png"); !errors.Is(err, c.want) {
 			t.Errorf("Check %s：%v，預期 %v", c.name, err, c.want)
 		}
-		if _, err := f.Fetch(context.Background(), srv.URL+"/a.png"); err == nil {
-			t.Errorf("Fetch %s：不應下載成功", c.name)
+		// 最後一輪把關後 PM 決定：Fetch 遇到「無法確認」時放行，交給後續解碼判斷；確定不是圖片仍失敗。
+		data, err := f.Fetch(context.Background(), srv.URL+"/a.png")
+		switch {
+		case errors.Is(c.want, ErrUnconfirmedImage) && (err != nil || !bytes.Equal(data, png)):
+			t.Errorf("Fetch %s：無法確認時應放行：%v", c.name, err)
+		case errors.Is(c.want, ErrNotImage) && !errors.Is(err, ErrNotImage):
+			t.Errorf("Fetch %s：確定不是圖片時應失敗：%v", c.name, err)
 		}
 	}
 }
@@ -556,5 +562,71 @@ func TestURLCheck_SVGDetection(t *testing.T) {
 				t.Errorf("%s（Content-Type %q）：%v，預期 %v", c.name, ct, err, c.want)
 			}
 		}
+	}
+}
+
+// 最後一輪把關後的使用者決定：Refresh 標頭（任何值）、Content-Disposition attachment 且檔名不是圖片副檔名 → 無法確認；
+// PM 決定：Content-Encoding 不是 identity 且未被自動解壓 → 無法確認。其他（inline、圖片檔名、自動解壓的 gzip）照常確認。
+func TestURLCheck_RefreshDispositionEncoding(t *testing.T) {
+	gifBody := []byte("GIF89a\x01\x00\x01\x00\x00\x00\x00;")
+	cases := []struct {
+		name string
+		hdr  map[string][]string
+		ok   bool
+	}{
+		{"Refresh 空值", map[string][]string{"Refresh": {""}}, false},
+		{"Refresh 5 秒", map[string][]string{"Refresh": {"5"}}, false},
+		{"attachment 沒有檔名", map[string][]string{"Content-Disposition": {"attachment"}}, false},
+		{"ATTACHMENT 大寫、檔名 .exe", map[string][]string{"Content-Disposition": {`ATTACHMENT; filename="a.exe"`}}, false},
+		{"attachment filename* 為 .html", map[string][]string{"Content-Disposition": {`attachment; filename*=UTF-8''login.html`}}, false},
+		{"attachment filename 是圖片但 filename* 是 .html", map[string][]string{"Content-Disposition": {`attachment; filename="a.gif"; filename*=UTF-8''a.html`}}, false},
+		{"attachment 無法解析", map[string][]string{"Content-Disposition": {`attachment; filename=`}}, false},
+		{"多個 Content-Disposition，其一為 attachment .html", map[string][]string{"Content-Disposition": {"inline", `attachment; filename="x.html"`}}, false},
+		{"Content-Encoding br（未解壓）", map[string][]string{"Content-Encoding": {"br"}}, false},
+		{"Content-Encoding deflate", map[string][]string{"Content-Encoding": {"deflate"}}, false},
+		{"attachment 檔名 .GIF", map[string][]string{"Content-Disposition": {`attachment; filename="a.GIF"`}}, true},
+		{"attachment filename* 為 .webp", map[string][]string{"Content-Disposition": {`attachment; filename*=UTF-8''%E5%9C%96.webp`}}, true},
+		{"inline", map[string][]string{"Content-Disposition": {"inline"}}, true},
+		{"Content-Encoding identity", map[string][]string{"Content-Encoding": {"identity"}}, true},
+	}
+	for _, c := range cases {
+		srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/gif")
+			for k, v := range c.hdr {
+				w.Header()[k] = v
+			}
+			w.Write(gifBody)
+		})
+		err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.gif")
+		switch {
+		case c.ok && err != nil:
+			t.Errorf("%s：應確認成功：%v", c.name, err)
+		case !c.ok && !errors.Is(err, ErrUnconfirmedImage):
+			t.Errorf("%s：應為 ErrUnconfirmedImage：%v", c.name, err)
+		}
+	}
+	// 伺服器回 gzip、由 Transport 自動解壓（Uncompressed）→ 照常確認。
+	srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/gif")
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		zw.Write(gifBody)
+		zw.Close()
+	})
+	if err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.gif"); err != nil {
+		t.Errorf("自動解壓的 gzip 應確認成功：%v", err)
+	}
+}
+
+// Fetch 不套用 Refresh／Content-Disposition 規則（新訊息有解碼檢查）。
+func TestURLFetch_IgnoresRefreshAndDisposition(t *testing.T) {
+	srv, _ := countingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Refresh", "0")
+		w.Header().Set("Content-Disposition", `attachment; filename="x.bin"`)
+		w.Write([]byte("png"))
+	})
+	if data, err := newURLFetcher(allowOnly(srv)).Fetch(context.Background(), srv.URL+"/a.png"); err != nil || string(data) != "png" {
+		t.Errorf("Fetch 應照常下載：%q %v", data, err)
 	}
 }

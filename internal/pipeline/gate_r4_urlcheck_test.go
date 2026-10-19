@@ -121,8 +121,8 @@ func TestGateR4_URLCheck_SVGVariants(t *testing.T) {
 	}
 }
 
-// 記錄現況（非必修，供 PM 判斷）：以下情況 Check 回 nil，/search 會不看預覽直接公開貼出。
-// 這些都不會讓瀏覽器在該網址執行 script，但可能被用於釣魚（見回報的待決定問題）。
+// 原本只記錄現況（Check 回 nil）；最後一輪把關後的使用者決定：帶 Refresh 標頭，或 Content-Disposition attachment 且檔名
+// 不是圖片副檔名時，歸為無法確認（ErrUnconfirmedImage），改為斷言。
 func TestGateR4_URLCheck_DocumentedNilCases(t *testing.T) {
 	cases := []struct {
 		name string
@@ -139,7 +139,9 @@ func TestGateR4_URLCheck_DocumentedNilCases(t *testing.T) {
 			w.Write([]byte("GIF89a<html><script>alert(1)</script></html>"))
 		}))
 		err := newURLFetcher(allowOnly(srv)).Check(context.Background(), srv.URL+"/a.gif")
-		t.Logf("%s：Check = %v", c.name, err)
+		if !errors.Is(err, ErrUnconfirmedImage) {
+			t.Errorf("%s：應為 ErrUnconfirmedImage，得到 %v", c.name, err)
+		}
 		srv.Close()
 	}
 }
