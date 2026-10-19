@@ -17,6 +17,8 @@ import (
 
 // 把關（階段 6 第二輪）：discordgo v0.29.0 反序列化 MESSAGE_UPDATE 時，
 // 沒有 attachments 欄位或為 null → nil；空陣列 → 非 nil 的空切片。並經過 state 合併後仍保持不變。
+// 圖片網址支援（2026-10-19 規劃 Task 4）後：attachments 為 nil 的部分更新改為重讀完整訊息，
+// 所以 fake 中放好最新訊息（新文字、仍有 1 張圖），事件帶 embeds 空陣列；預期結果與原本相同。
 func TestGate6_MessageUpdateAttachmentsNilVsEmpty(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -31,7 +33,7 @@ func TestGate6_MessageUpdateAttachmentsNilVsEmpty(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			raw := `{"id":"100","channel_id":"c","guild_id":"g","content":"新文字","author":{"id":"u1"}` + c.attachJSON + `}`
+			raw := `{"id":"100","channel_id":"c","guild_id":"g","content":"新文字","author":{"id":"u1"},"embeds":[]` + c.attachJSON + `}`
 			var ev discordgo.MessageUpdate
 			if err := json.Unmarshal([]byte(raw), &ev); err != nil {
 				t.Fatal(err)
@@ -57,9 +59,10 @@ func TestGate6_MessageUpdateAttachmentsNilVsEmpty(t *testing.T) {
 				t.Fatalf("Attachments == nil 為 %v，預期 %v（%#v）", got, c.wantNil, ev.Message.Attachments)
 			}
 
-			_, st, x, _, h := newHooksEnv(t)
+			f, st, x, _, h := newHooksEnv(t)
 			addSource(t, st, "g", "c", "200")
 			x.PutLegacy("g", legacyMsg("c", "100", "舊文字", 1))
+			f.AddMessage(legacyMsg("c", "100", "新文字", 1)) // 部分更新時重讀的最新訊息
 			h.MessageUpdated(ev.Message)
 			e, ok := x.Get(Key{ChannelID: "c", MessageID: "100"})
 			if ok != c.wantKept {

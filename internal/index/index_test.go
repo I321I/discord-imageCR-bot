@@ -19,8 +19,9 @@ func imageMsg(ch, id string, f imagemsg.Fields, uploader string) *discordgo.Mess
 	}
 }
 
+// legacyMsg 回傳完整的使用者帶圖訊息（Embeds 為空陣列：當作 MESSAGE_UPDATE 時是完整更新，不需重讀）。
 func legacyMsg(ch, id, content string, n int) *discordgo.Message {
-	m := &discordgo.Message{ID: id, ChannelID: ch, Content: content, Author: &discordgo.User{ID: "u1"}}
+	m := &discordgo.Message{ID: id, ChannelID: ch, Content: content, Author: &discordgo.User{ID: "u1"}, Embeds: []*discordgo.MessageEmbed{}}
 	for i := 0; i < n; i++ {
 		m.Attachments = append(m.Attachments, &discordgo.MessageAttachment{Filename: fmt.Sprintf("%d.png", i), ContentType: "image/png"})
 	}

@@ -174,3 +174,24 @@ func (s *Store) Snapshot() *Data {
 	defer s.mu.RUnlock()
 	return s.data.Clone()
 }
+
+// errURLSinceSet 表示 URLSince 已有值，EnsureURLSince 不寫入。
+var errURLSinceSet = errors.New("url_since already set")
+
+// EnsureURLSince 在資料沒有圖片網址功能上線時間點時設為 at 並寫入儲存頻道，回傳目前的值；
+// 已有值時不寫入，回傳原值。寫入失敗時記憶體中的資料不變（回錯誤）。
+func (s *Store) EnsureURLSince(ctx context.Context, at string) (string, error) {
+	err := s.Update(ctx, func(d *Data) error {
+		if d.URLSince != "" {
+			return errURLSinceSet
+		}
+		d.URLSince = at
+		return nil
+	})
+	switch {
+	case errors.Is(err, errURLSinceSet):
+	case err != nil:
+		return "", err
+	}
+	return s.Snapshot().URLSince, nil
+}

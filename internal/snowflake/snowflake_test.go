@@ -1,6 +1,12 @@
 package snowflake
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/bwmarrin/discordgo"
+)
 
 func TestCompare_Numeric(t *testing.T) {
 	cases := []struct {
@@ -54,5 +60,24 @@ func TestValid(t *testing.T) {
 		if Valid(s) {
 			t.Errorf("%q 不應合法", s)
 		}
+	}
+}
+
+func TestFromTime(t *testing.T) {
+	at := time.UnixMilli(1420070400000 + 1000).UTC()
+	got := FromTime(at)
+	if got != strconv.FormatUint(1000<<22, 10) {
+		t.Errorf("FromTime = %s", got)
+	}
+	ts, err := discordgo.SnowflakeTimestamp(got)
+	if err != nil || !ts.Equal(at) {
+		t.Errorf("轉回時間不一致：%v %v", ts, err)
+	}
+	// 比之後的時間產生的 snowflake 早
+	if !Less(got, FromTime(at.Add(time.Millisecond))) {
+		t.Error("較早的時間應產生較小的 snowflake")
+	}
+	if got := FromTime(time.UnixMilli(0)); got != "0" {
+		t.Errorf("Discord epoch 之前應為 0：%s", got)
 	}
 }

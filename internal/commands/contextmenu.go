@@ -427,7 +427,7 @@ func (c *ContextMenu) editMessage(m *discordgo.Message, content string) bool {
 
 // Rerecognize 是「重新辨識」的 handler。
 //   - bot 的圖片訊息：只重跑標失敗的作品、圖片文字（沒有則提示）；
-//   - 使用者自己發、帶 bot ❌ 的原訊息：重新處理整則（同自動處理流程）；
+//   - 使用者自己發、帶 bot ❌ 的原訊息（圖片附件或圖片網址）：重新處理整則（同自動處理流程，網址圖重新下載）；
 //   - 其他訊息：提示只能對圖片訊息使用。
 func (c *ContextMenu) Rerecognize(ctx context.Context, i *discordgo.InteractionCreate) {
 	m := targetMessage(i)

@@ -18,6 +18,7 @@ import (
 	"discordbot/internal/index"
 	"discordbot/internal/pipeline"
 	"discordbot/internal/recognize"
+	"discordbot/internal/snowflake"
 	"discordbot/internal/store"
 
 	"github.com/bwmarrin/discordgo"
@@ -53,7 +54,7 @@ func main() {
 	}
 
 	st := store.New(sess, cfg.StorageChannelID)
-	loadStore(ctx, st)
+	storeLoaded := loadStore(ctx, st)
 
 	// 來源頻道自動處理：trace.moe 與 OCR 各自排隊（並行數 1）；原訊息一次只處理一則（佇列）。
 	ocr := recognize.NewRapidOCR()
@@ -64,6 +65,8 @@ func main() {
 		Work:  recognize.Serialize(recognize.NewTraceMoe(cfg.TraceMoeKey, cfg.TraceMoeMinSimilarity), 1),
 		Text:  recognize.SerializeText(ocr),
 		Store: st,
+		// 圖片網址訊息：網址圖以防 SSRF 的下載器下載（只連公開位址的 80、443）。
+		URLFetch: pipeline.NewURLFetcher(),
 	}
 	// 索引：頻道新增時掃描、移除時清除；訊息刪除與編輯時更新（Q31）。
 	// pipeline 經由 hooks 寫入索引，頻道移除後不再寫入。
@@ -81,13 +84,15 @@ func main() {
 		BotID:    hooks.BotID,
 		Ctx:      ctx,
 	}
-	// /search：搜尋使用者要搜尋的頻道（可用頻道 ∩ 勾選）中的圖，貼圖時重新抓訊息並重新上傳。
+	// /search：搜尋使用者要搜尋的頻道（可用頻道 ∩ 勾選）中的圖，貼圖時重新抓訊息並重新上傳；
+	// 網址圖先以防 SSRF 的下載器確認圖片還在，再貼出網址。
 	search := &commands.Search{
-		API:    sess,
-		Access: res,
-		Index:  idx,
-		Fetch:  pipeline.NewHTTPFetcher(),
-		Ctx:    ctx,
+		API:       sess,
+		Access:    res,
+		Index:     idx,
+		Fetch:     pipeline.NewHTTPFetcher(),
+		LinkCheck: pipeline.NewURLFetcher(),
+		Ctx:       ctx,
 	}
 	// /sources：使用者勾選 /search 要搜尋的頻道（存在儲存頻道）。
 	sources := &commands.Sources{API: sess, Access: res, Store: st}
@@ -104,10 +109,10 @@ func main() {
 	sess.AddHandler(onGuildCreate(st, hooks, sess.State))
 	sess.AddHandler(onMessageDelete(hooks))
 	sess.AddHandler(onMessageDeleteBulk(hooks))
-	sess.AddHandler(onMessageUpdate(hooks))
+	sess.AddHandler(onMessageUpdate(ctx, hooks, p))
 	sess.AddHandler(onMessageCreate(ctx, p))
 	// 啟動掃描由 READY 觸發（首次連線與斷線後重新 IDENTIFY 都會收到；RESUME 不會），不在 Open 之後另外掃描。
-	sess.AddHandler(onReady(hooks, st))
+	sess.AddHandler(onReady(hooks, st, storeLoaded))
 
 	err = sess.Open()
 	if err != nil {
@@ -199,13 +204,20 @@ func onMessageDeleteBulk(x messageIndexer) func(*discordgo.Session, *discordgo.M
 	}
 }
 
-// onMessageUpdate 回傳訊息編輯事件的 handler：更新索引（Q31）。
-func onMessageUpdate(x messageIndexer) func(*discordgo.Session, *discordgo.MessageUpdate) {
+// messageUpdateHandler 處理訊息更新（*pipeline.Pipeline 直接滿足）。
+type messageUpdateHandler interface {
+	HandleMessageUpdate(ctx context.Context, m *discordgo.Message)
+}
+
+// onMessageUpdate 回傳訊息編輯事件的 handler：更新索引（Q31），並在背景交給 pipeline
+// （預覽補上或編輯加上圖片網址的新訊息要處理）。
+func onMessageUpdate(ctx context.Context, x messageIndexer, h messageUpdateHandler) func(*discordgo.Session, *discordgo.MessageUpdate) {
 	return func(_ *discordgo.Session, e *discordgo.MessageUpdate) {
 		if e.Message == nil {
 			return
 		}
 		x.MessageUpdated(e.Message)
+		go h.HandleMessageUpdate(ctx, e.Message)
 	}
 }
 
@@ -216,12 +228,15 @@ type readyScanner interface {
 	ScanAll(d *store.Data)
 }
 
-// onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景先清除、再掃描所有來源頻道。
+// onReady 回傳 READY 事件的 handler：設定 bot ID 後在背景先確定圖片網址功能上線時間點、清除，再掃描所有來源頻道。
+// 上線時間點（U1）：ensureURLSince（設定已成功讀取）且設定中還沒有時，以收到 READY 的時間寫入並存回；
+// 寫入失敗只記 log（只含圖片網址的訊息當舊圖片訊息）。設定讀取失敗、以空資料啟動時不寫入，
+// 避免自動以空資料蓋掉儲存頻道中的設定。
 // 清除：比對 READY 中 bot 所在的伺服器（暫時無法使用的也算仍在），移除已不在的伺服器的來源頻道（離線期間被踢出的殘留，
 // 階段 11 決定 1）；沒有變動時不寫入；伺服器清單為空時不清除（PM 決定，比照 GUILD_CREATE）。
 // 掃描（用清除後的設定）：讀各來源頻道歷史建立索引，設定時間點之後未處理的訊息（含斷線期間的訊息）依舊到新交給佇列補處理；
 // 掃描期間 /search 回傳已建好的部分（Q52）。同一頻道重複掃描時舊的會被取消，已在佇列中的訊息不會重複排入。
-func onReady(h readyScanner, st *store.Store) func(*discordgo.Session, *discordgo.Ready) {
+func onReady(h readyScanner, st *store.Store, ensureURLSince bool) func(*discordgo.Session, *discordgo.Ready) {
 	return func(_ *discordgo.Session, e *discordgo.Ready) {
 		receivedAt := time.Now()
 		if e.User != nil {
@@ -234,6 +249,13 @@ func onReady(h readyScanner, st *store.Store) func(*discordgo.Session, *discordg
 			}
 		}
 		go func() {
+			if ensureURLSince {
+				if at, err := st.EnsureURLSince(context.Background(), snowflake.FromTime(receivedAt)); err != nil {
+					log.Printf("寫入圖片網址功能上線時間點失敗，只含圖片網址的訊息暫時當舊圖片訊息：%v", err)
+				} else {
+					log.Printf("圖片網址功能上線時間點：%s", at)
+				}
+			}
 			if len(present) == 0 {
 				// 比照 GUILD_CREATE 頻道清單為空就跳過：清單為空可能是異常的 READY，不清除任何來源頻道。
 				log.Print("READY 的伺服器清單為空，不清除來源頻道")
@@ -245,12 +267,14 @@ func onReady(h readyScanner, st *store.Store) func(*discordgo.Session, *discordg
 	}
 }
 
-// loadStore 讀取儲存頻道；讀取失敗或找不到完整版本時記 log，並以空資料啟動。
-func loadStore(ctx context.Context, st *store.Store) {
+// loadStore 讀取儲存頻道；讀取失敗或找不到完整版本時記 log，並以空資料啟動。回傳是否成功讀取（不是以空資料啟動）。
+func loadStore(ctx context.Context, st *store.Store) bool {
 	if err := st.Load(ctx); err != nil {
 		log.Printf("讀取儲存頻道失敗，以空資料啟動：%v", err)
 		st.UseEmpty()
+		return false
 	}
+	return true
 }
 
 // onChannelDelete 回傳頻道刪除事件的 handler：被刪除的來源頻道自動從設定移除並寫回。

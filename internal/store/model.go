@@ -4,6 +4,8 @@ package store
 import (
 	"slices"
 	"strconv"
+
+	"discordbot/internal/snowflake"
 )
 
 const FormatVersion = 1
@@ -15,6 +17,9 @@ type Data struct {
 	// UserSelections：userID → channelIDs；key 不存在 = 沒選過（預設全選）。
 	// （欄位名稱與方法 UserChannels 不能相同，所以叫 UserSelections。）
 	UserSelections map[string][]string `json:"user_channels"`
+	// URLSince 是圖片網址功能上線時間點（snowflake，U1）：只含圖片網址的使用者訊息早於
+	// max(設定時間點, URLSince) 時只收進搜尋、不處理。舊版資料沒有此欄位（空字串）。
+	URLSince string `json:"url_since,omitempty"`
 }
 
 func NewData() *Data {
@@ -109,6 +114,7 @@ func (d *Data) Clone() *Data {
 		FormatVersion:  d.FormatVersion,
 		Guilds:         make(map[string]map[string]string, len(d.Guilds)),
 		UserSelections: make(map[string][]string, len(d.UserSelections)),
+		URLSince:       d.URLSince,
 	}
 	for g, chs := range d.Guilds {
 		m := make(map[string]string, len(chs))
@@ -143,4 +149,18 @@ func compareSnowflake(a, b string) int {
 		return 1
 	}
 	return 0
+}
+
+// IsNewMessage 回傳來源頻道中 ID 為 messageID 的使用者訊息是否為「設定時間點之後的新訊息」（要處理），
+// 否則為舊圖片訊息（只收進搜尋）。附件訊息（linkOnly=false）只看 setAt；只含圖片網址、沒有附件的訊息
+// （linkOnly=true）看 max(setAt, urlSince)（U1）。setAt 或（網址訊息的）urlSince 不合法時無法判斷先後，
+// 一律不算新訊息（安全側：不處理、不刪原訊息）。等於時間點算新訊息。
+func IsNewMessage(messageID, setAt, urlSince string, linkOnly bool) bool {
+	if !snowflake.Valid(setAt) || snowflake.Less(messageID, setAt) {
+		return false
+	}
+	if linkOnly && (!snowflake.Valid(urlSince) || snowflake.Less(messageID, urlSince)) {
+		return false
+	}
+	return true
 }

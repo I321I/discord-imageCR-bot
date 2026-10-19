@@ -7,6 +7,7 @@ import (
 	"log"
 	"slices"
 	"sync"
+	"time"
 
 	"discordbot/internal/imagemsg"
 	"discordbot/internal/recognize"
@@ -39,6 +40,9 @@ type NopIndex struct{}
 
 func (NopIndex) PutImageMessage(string, *discordgo.Message) {}
 
+// defaultEmbedWait 是新訊息含尚無預覽的連結時，延後重讀訊息再判定的預設時間（U9）。
+const defaultEmbedWait = 5 * time.Second
+
 // Pipeline 處理來源頻道的新訊息。Work、Text 由呼叫端包上排隊（recognize.Serialize、SerializeText）。
 type Pipeline struct {
 	API   API
@@ -47,6 +51,10 @@ type Pipeline struct {
 	Text  recognize.TextRecognizer
 	Store *store.Store
 	Index IndexSink
+	// URLFetch 下載網址圖（正式為 *URLFetcher，防 SSRF）；nil 時網址圖一律下載失敗。
+	URLFetch Fetcher
+	// EmbedWait 是新訊息含尚無預覽的連結時，延後多久重讀訊息再判定；0 為 defaultEmbedWait。
+	EmbedWait time.Duration
 
 	decodeOnce sync.Once
 	decodeSlot chan struct{} // 容量 1：全域同時只解碼一張原圖

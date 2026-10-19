@@ -364,13 +364,15 @@ func (r *recordIndexer) MessagesDeleted(channelID string, ids []string) {
 func (r *recordIndexer) MessageUpdated(m *discordgo.Message) { r.updated = append(r.updated, m.ID) }
 
 // Q31：訊息刪除、批次刪除、編輯事件交給索引。
+// （圖片網址支援後 onMessageUpdate 另外交給 pipeline，見 TestOnMessageUpdate_CallsIndexAndPipeline；此處以不做事的 handler 代替。）
 func TestOnMessageEvents_UpdateIndex(t *testing.T) {
 	r := &recordIndexer{}
+	nop := nopUpdateHandler{}
 	onMessageDelete(r)(nil, &discordgo.MessageDelete{Message: &discordgo.Message{ID: "1", ChannelID: "c"}})
 	onMessageDeleteBulk(r)(nil, &discordgo.MessageDeleteBulk{ChannelID: "c", Messages: []string{"2", "3"}})
-	onMessageUpdate(r)(nil, &discordgo.MessageUpdate{Message: &discordgo.Message{ID: "4", ChannelID: "c"}})
+	onMessageUpdate(context.Background(), r, nop)(nil, &discordgo.MessageUpdate{Message: &discordgo.Message{ID: "4", ChannelID: "c"}})
 	onMessageDelete(r)(nil, &discordgo.MessageDelete{})
-	onMessageUpdate(r)(nil, &discordgo.MessageUpdate{})
+	onMessageUpdate(context.Background(), r, nop)(nil, &discordgo.MessageUpdate{})
 	if want := []string{"c/1", "c/2", "c/3"}; !slices.Equal(r.deleted, want) {
 		t.Errorf("刪除 %v，預期 %v", r.deleted, want)
 	}
@@ -407,3 +409,7 @@ func TestNewRouter_WiresSources(t *testing.T) {
 		t.Error("/sources 的選單沒有 handler")
 	}
 }
+
+type nopUpdateHandler struct{}
+
+func (nopUpdateHandler) HandleMessageUpdate(context.Context, *discordgo.Message) {}

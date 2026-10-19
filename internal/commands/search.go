@@ -31,6 +31,8 @@ const (
 	msgSearchDownloadFailed = "下載圖片失敗，請稍後再試"        // 下載失敗（網路、長度不符）
 	msgSearchPostFailed     = "貼圖失敗，請稍後再試"          // 其他上傳錯誤
 	msgSearchQueueTimeout   = "目前貼圖的人太多，請稍後再試"      // 排隊超過 MaxWait（暫定）
+	msgSearchLinkGone       = "圖床上的圖片已被刪除，無法貼出"     // 網址圖：圖床回 404／410 或內容不是圖片
+	msgSearchLinkUnverified = "目前無法確認圖片，請稍後再試"      // 網址圖：網路錯誤、逾時、被安全規則擋下等
 )
 
 // defaultSearchMaxWait 是排隊等貼圖的預設上限：deferred 回應的 token 只有 15 分鐘，
@@ -71,12 +73,20 @@ type SearchIndex interface {
 	RemoveAttachment(k index.Key)
 }
 
+// LinkChecker 確認網址上的圖片還在（*pipeline.URLFetcher 直接滿足，防 SSRF）：
+// 圖片已被刪除回 pipeline.ErrImageGone，內容不是圖片回 pipeline.ErrNotImage。
+type LinkChecker interface {
+	Check(ctx context.Context, url string) error
+}
+
 // Search 實作 /search 的 autocomplete 與送出。可用場景：伺服器、與 bot 的私訊、其他私訊與群組（Q41）。
 type Search struct {
 	API    SearchAPI
 	Access SearchAccess
 	Index  SearchIndex
 	Fetch  pipeline.Fetcher
+	// LinkCheck 在貼出網址圖前確認圖片還在；nil 時網址圖一律回「目前無法確認圖片」。
+	LinkCheck LinkChecker
 	// Ctx 是 bot 關機時才取消的 ctx：排隊等貼圖時關機就放棄；nil 時只用 handler 的 ctx。
 	Ctx context.Context
 	// MaxWait 是排隊等貼圖的上限，超過就放棄（刪除 deferred 回應、改發 ephemeral followup）；0 為 defaultSearchMaxWait。
@@ -144,7 +154,7 @@ func (s *Search) Autocomplete(ctx context.Context, i *discordgo.InteractionCreat
 //   - 圖片訊息：「作品｜圖片文字」，空欄省略、失敗欄位顯示「⚠️」；兩欄都空時改顯示「角色｜關鍵字」（使用者決定），
 //     全部空白為 choiceNameEmpty；
 //   - 舊圖片訊息：訊息文字開頭；
-//   - 換行與連續空白換成一個空白；一則訊息有多張圖時加「（第 N 張）」（第 1 張也標；張數與編號只計圖片附件）；
+//   - 換行與連續空白換成一個空白；一則訊息有多張圖時加「（第 N 張）」（第 1 張也標；張數與編號計圖片附件與圖片網址）；
 //   - 超過 100 字時截斷文字並加「…」（編號保留）。長度以 UTF-16 單位計算（保守：emoji 等算 2）。
 func ChoiceName(e index.Entry) string {
 	var body string
@@ -220,7 +230,8 @@ func oneLine(s string) string {
 //     值由 client 傳來、可被偽造，所以重新檢查；否則 ephemeral「找不到這張圖片」（不區分沒權限與不存在，Q40）。
 //     值不是 Key（直接送出自己打的字）→ 貼出第一個符合的結果；沒有符合 → ephemeral「找不到符合的圖片」（Q35）。
 //  2. 回 deferred 公開回應 → 排隊（同時貼圖數有上限，排到才讀訊息與下載）→ 重新抓訊息取得最新附件網址 →
-//     下載 → 以附件重新上傳，只發圖片（Q39）。
+//     下載 → 以附件重新上傳，只發圖片（Q39）。網址圖：重新抓訊息確認網址仍在 → 確認圖床上的圖片還在
+//     （LinkCheck）→ 貼出網址（不下載、不重新上傳；劇透時為 ||網址||；mention 不通知）。
 //  3. deferred 之後才發現錯誤：刪除 deferred 回應，改發 ephemeral followup。訊息已不存在（404）時從索引移除；
 //     附件序號越界、附件 ID 與索引不符或已不是圖片時只移除索引中該筆。
 //
@@ -266,7 +277,7 @@ func (s *Search) Submit(ctx context.Context, i *discordgo.InteractionCreate) {
 	}
 }
 
-// post 排到後讀訊息、下載並以附件補上 deferred 回應；失敗時回傳要告知使用者的文字。
+// post 排到後讀訊息、下載並以附件補上 deferred 回應（網址圖見 postLink）；失敗時回傳要告知使用者的文字。
 func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, entry index.Entry) string {
 	key := entry.Key
 	ctx, cancel := withShutdown(ctx, s.Ctx)
@@ -289,6 +300,9 @@ func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, entry
 			log.Printf("/search：讀取訊息 %s/%s 失敗：%v", key.ChannelID, key.MessageID, err)
 		}
 		return msgSearchImageGone
+	}
+	if key.Link {
+		return s.postLink(ctx, i, entry, m)
 	}
 	var a *discordgo.MessageAttachment
 	if key.Attachment < len(m.Attachments) {
@@ -318,6 +332,51 @@ func (s *Search) post(ctx context.Context, i *discordgo.InteractionCreate, entry
 		if uploadTooLarge(err) {
 			return msgSearchUploadTooLarge
 		}
+		return msgSearchPostFailed
+	}
+	return ""
+}
+
+// postLink 貼出網址圖（已取得貼圖位置、m 為重新抓到的訊息）：網址已不在該位置 → 移除該筆、「找不到」；
+// 確認圖床上的圖片：已刪除或不是圖片 → 移除該筆、「圖床上的圖片已被刪除」；其他失敗 → 「目前無法確認圖片」；
+// 確認後以網址補上 deferred 回應（mention 不通知）。失敗時回傳要告知使用者的文字。
+func (s *Search) postLink(ctx context.Context, i *discordgo.InteractionCreate, entry index.Entry, m *discordgo.Message) string {
+	key := entry.Key
+	var src *recognize.ImageSource
+	for _, x := range recognize.LinkSources(m) {
+		if x.Index == key.Attachment && x.URL == entry.ImageURL {
+			src = &x
+			break
+		}
+	}
+	if src == nil {
+		s.Index.RemoveAttachment(key)
+		return msgSearchImageGone
+	}
+	if s.LinkCheck == nil {
+		return msgSearchLinkUnverified
+	}
+	if err := s.LinkCheck.Check(ctx, src.FetchURL); err != nil {
+		log.Printf("/search：確認 %s/%s 的網址圖 %s 失敗：%v", key.ChannelID, key.MessageID, src.FetchURL, err)
+		switch {
+		case ctx.Err() != nil:
+			return msgRestarting
+		case errors.Is(err, pipeline.ErrImageGone), errors.Is(err, pipeline.ErrNotImage):
+			s.Index.RemoveAttachment(key)
+			return msgSearchLinkGone
+		}
+		return msgSearchLinkUnverified
+	}
+	content := src.URL
+	if src.Spoiler {
+		content = "||" + content + "||"
+	}
+	_, err := s.API.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content:         &content,
+		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+	})
+	if err != nil {
+		log.Printf("/search：貼出網址（interaction %s）失敗：%v", i.ID, err)
 		return msgSearchPostFailed
 	}
 	return ""

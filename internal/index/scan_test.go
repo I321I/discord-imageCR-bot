@@ -70,7 +70,7 @@ func TestScan_ClassifiesBySetAt(t *testing.T) {
 	addUserImage(f, "c", "202", "新圖")
 	addUserImage(f, "c", "203", "")
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := keys(x.Search("", allow("c"), 0)); !slices.Equal(got, []string{"c:150:0", "c:101:0", "c:100:0"}) {
@@ -93,7 +93,7 @@ func TestScan_SnowflakeNumericCompare(t *testing.T) {
 	addUserImage(f, "c", "999", "舊")
 	addUserImage(f, "c", "10000", "新")
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "1000"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "1000", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := x.Get(Key{ChannelID: "c", MessageID: "999"}); !ok {
@@ -110,7 +110,7 @@ func TestScan_Paginates(t *testing.T) {
 		addUserImage(f, "c", strconv.Itoa(1000+i), "文字")
 	}
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "1100"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "1100", ""); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(x.Search("", allow("c"), 0)); n != 99 {
@@ -140,7 +140,7 @@ func TestScan_BotNonImageMessagesIgnored(t *testing.T) {
 		f.AddMessage(&discordgo.Message{ID: id, ChannelID: "c", Author: &discordgo.User{ID: "u"}})
 	}
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "20"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "20", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := x.Search("", allow("c"), 0); len(got) != 0 {
@@ -160,7 +160,7 @@ func TestScan_FailedOriginalNeitherBackfilledNorIndexed(t *testing.T) {
 	o := addUserImage(f, "c", "301", "")
 	o.Reactions = []*discordgo.MessageReactions{{Count: 1, Me: false, Emoji: &discordgo.Emoji{Name: "❌"}}}
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := bf.got(); !slices.Equal(got, []string{"301"}) {
@@ -174,7 +174,7 @@ func TestScan_FailedOriginalNeitherBackfilledNorIndexed(t *testing.T) {
 func TestScan_ErrorReturned(t *testing.T) {
 	f := discordtest.NewFake()
 	f.FailOn["ChannelMessages"] = discordtest.ErrInjected
-	if err := ScanChannel(context.Background(), f, New(), &fakeBackfill{}, botID, "g", "c", "1"); err == nil {
+	if err := ScanChannel(context.Background(), f, New(), &fakeBackfill{}, botID, "g", "c", "1", ""); err == nil {
 		t.Error("讀取失敗應回錯誤")
 	}
 }
@@ -186,7 +186,7 @@ func TestScan_CanceledDoesNotBackfill(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	bf := &fakeBackfill{}
-	if err := ScanChannel(ctx, f, New(), bf, botID, "g", "c", "200"); err == nil {
+	if err := ScanChannel(ctx, f, New(), bf, botID, "g", "c", "200", ""); err == nil {
 		t.Error("取消時應回錯誤")
 	}
 	if got := bf.got(); len(got) != 0 {
@@ -224,7 +224,7 @@ func TestScan_PartialResultsSearchableDuringScan(t *testing.T) {
 	api := &blockSecondPage{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
 	x := New()
 	done := make(chan error, 1)
-	go func() { done <- ScanChannel(context.Background(), api, x, &fakeBackfill{}, botID, "g", "c", "1") }()
+	go func() { done <- ScanChannel(context.Background(), api, x, &fakeBackfill{}, botID, "g", "c", "1", "") }()
 	<-api.entered
 	if n := len(x.Search("甲", allow("c"), 0)); n != 100 {
 		t.Errorf("第一頁讀完後應可搜到 100 筆，得到 %d", n)
@@ -493,15 +493,18 @@ func TestHooks_PutImageMessageSkipsRemovedChannel(t *testing.T) {
 }
 
 // 舊圖片訊息收到沒有附件資訊（nil）的更新：保守不移除；附件確定被清空（空陣列）才移除。
+// 圖片網址支援（2026-10-19 規劃 Task 4）後：nil 的部分更新改為重讀（fake 中放好仍有圖片的最新訊息）；
+// 清空附件的更新需帶 Embeds（完整更新）。預期結果相同。
 func TestOnMessageUpdate_NoAttachmentInfoKeepsLegacy(t *testing.T) {
-	_, st, x, _, h := newHooksEnv(t)
+	f, st, x, _, h := newHooksEnv(t)
 	addSource(t, st, "g", "c", "200")
 	x.PutLegacy("g", legacyMsg("c", "100", "舊文字", 1))
+	f.AddMessage(legacyMsg("c", "100", "舊文字", 1))
 	h.MessageUpdated(&discordgo.Message{ID: "100", ChannelID: "c", Content: "舊文字", Author: &discordgo.User{ID: "u1"}})
 	if _, ok := x.Get(Key{ChannelID: "c", MessageID: "100"}); !ok {
 		t.Error("沒有附件資訊的更新不應移除")
 	}
-	h.MessageUpdated(&discordgo.Message{ID: "100", ChannelID: "c", Content: "舊文字", Author: &discordgo.User{ID: "u1"}, Attachments: []*discordgo.MessageAttachment{}})
+	h.MessageUpdated(&discordgo.Message{ID: "100", ChannelID: "c", Content: "舊文字", Author: &discordgo.User{ID: "u1"}, Attachments: []*discordgo.MessageAttachment{}, Embeds: []*discordgo.MessageEmbed{}})
 	if _, ok := x.Get(Key{ChannelID: "c", MessageID: "100"}); ok {
 		t.Error("附件被清空時應移除")
 	}

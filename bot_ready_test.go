@@ -48,7 +48,7 @@ func (r *recordScanner) ScanAll(d *store.Data) {
 func TestOnReady_ScansAllEachReady(t *testing.T) {
 	_, st := newLoadedStore(t, "g", "c1")
 	r := &recordScanner{done: make(chan struct{}, 2)}
-	h := onReady(r, st)
+	h := onReady(r, st, false)
 	for i := 0; i < 2; i++ {
 		// 階段 11 決定 1 之後 READY 沒列出的伺服器會被清除，所以補上伺服器 g。
 		h(nil, &discordgo.Ready{User: &discordgo.User{ID: "bot"}, Guilds: []*discordgo.Guild{{ID: "g"}}})
@@ -73,7 +73,7 @@ func TestOnReady_ScansAllEachReady(t *testing.T) {
 func TestOnReady_NilUserStillScans(t *testing.T) {
 	_, st := newLoadedStore(t, "g", "c1")
 	r := &recordScanner{done: make(chan struct{}, 1), botID: "old"}
-	onReady(r, st)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g"}}}) // 階段 11 決定 1：補上伺服器 g
+	onReady(r, st, false)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g"}}}) // 階段 11 決定 1：補上伺服器 g
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):
@@ -97,7 +97,7 @@ func TestOnReady_PrunesAbsentGuildsBeforeScan(t *testing.T) {
 	}
 	sent := len(f.Sent)
 	r := &recordScanner{done: make(chan struct{}, 1)}
-	onReady(r, st)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g1"}, {ID: "g2", Unavailable: true}}})
+	onReady(r, st, false)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g1"}, {ID: "g2", Unavailable: true}}})
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):
@@ -127,7 +127,7 @@ func TestOnReady_NoAbsentGuildDoesNotWrite(t *testing.T) {
 	f, st := newLoadedStore(t, "g1", "c1")
 	sent := len(f.Sent)
 	r := &recordScanner{done: make(chan struct{}, 1)}
-	onReady(r, st)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g1"}}})
+	onReady(r, st, false)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{{ID: "g1"}}})
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):
@@ -143,7 +143,7 @@ func TestOnReady_EmptyGuildListSkipsPrune(t *testing.T) {
 	f, st := newLoadedStore(t, "g1", "c1")
 	sent := len(f.Sent)
 	r := &recordScanner{done: make(chan struct{}, 1)}
-	onReady(r, st)(nil, &discordgo.Ready{})
+	onReady(r, st, false)(nil, &discordgo.Ready{})
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):

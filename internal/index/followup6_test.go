@@ -25,7 +25,7 @@ func TestScan_FailedOriginalBeforeSetAtIndexedAsLegacy(t *testing.T) {
 	m := addUserImage(f, "c", "100", "失敗過的舊圖")
 	m.Reactions = failedReaction()
 	x, bf := New(), &fakeBackfill{}
-	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200"); err != nil {
+	if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", "200", ""); err != nil {
 		t.Fatal(err)
 	}
 	e, ok := x.Get(Key{ChannelID: "c", MessageID: "100"})
@@ -104,7 +104,7 @@ func TestScan_InvalidSetAtAllLegacy(t *testing.T) {
 			failed.Reactions = failedReaction()
 			addBotImage(f, "c", "7000", imagemsg.Fields{Work: "丁"})
 			x, bf := New(), &fakeBackfill{}
-			if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", setAt); err != nil {
+			if err := ScanChannel(context.Background(), f, x, bf, botID, "g", "c", setAt, ""); err != nil {
 				t.Fatal(err)
 			}
 			if got := bf.got(); len(got) != 0 {
@@ -162,7 +162,7 @@ func TestScan_ChannelMessagesUsesContext(t *testing.T) {
 	api := &ctxRecordingAPI{Fake: f}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := ScanChannel(ctx, api, New(), &fakeBackfill{}, botID, "g", "c", "1"); err != nil {
+	if err := ScanChannel(ctx, api, New(), &fakeBackfill{}, botID, "g", "c", "1", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(api.ctxs) < 2 {
@@ -276,10 +276,12 @@ func TestHooks_MessageUpdatedWritesUnderPutMu(t *testing.T) {
 }
 
 // PM 決定 (d)：MESSAGE_UPDATE 帶文字但 Attachments 為 nil → 保留既有附件，只更新舊圖片訊息的文字。
+// 圖片網址支援（2026-10-19 規劃 Task 4）後改為重讀完整訊息：fake 中放好最新訊息（新文字、2 張圖），預期結果相同。
 func TestOnMessageUpdate_NilAttachmentsUpdatesLegacyText(t *testing.T) {
-	_, st, x, _, h := newHooksEnv(t)
+	f, st, x, _, h := newHooksEnv(t)
 	addSource(t, st, "g", "c", "200")
 	x.PutLegacy("g", legacyMsg("c", "100", "舊文字", 2))
+	f.AddMessage(legacyMsg("c", "100", "新文字", 2))
 	h.MessageUpdated(&discordgo.Message{ID: "100", ChannelID: "c", Content: "新文字", Author: &discordgo.User{ID: "u1"}})
 	for i := 0; i < 2; i++ {
 		e, ok := x.Get(Key{ChannelID: "c", MessageID: "100", Attachment: i})

@@ -164,3 +164,17 @@ func TestFake_ResponseEditFilesAndDelete(t *testing.T) {
 		t.Errorf("應回注入的錯誤且不記錄：%v", err)
 	}
 }
+
+func TestReplaceMessage(t *testing.T) {
+	f := NewFake()
+	f.AddMessage(&discordgo.Message{ID: "10", ChannelID: "c", Content: "舊"})
+	f.ReplaceMessage(&discordgo.Message{ID: "10", ChannelID: "c", Content: "新"})
+	msgs := f.Messages("c")
+	if len(msgs) != 1 || msgs[0].Content != "新" {
+		t.Fatalf("應取代同 ID 的訊息：%+v", msgs)
+	}
+	f.ReplaceMessage(&discordgo.Message{ID: "5", ChannelID: "c", Content: "加"})
+	if msgs := f.Messages("c"); len(msgs) != 2 || msgs[0].ID != "5" {
+		t.Errorf("不存在時應新增（依 ID 排序）：%+v", msgs)
+	}
+}

@@ -47,18 +47,11 @@ func IsImageAttachment(a *discordgo.MessageAttachment) bool {
 	return imageExtensions[strings.ToLower(path.Ext(a.Filename))]
 }
 
-// Eligible 回傳訊息是否要自動處理：至少一個附件，且全部是圖片。
-// 只有連結/embed 或純文字的訊息不處理；含任何非圖片附件的訊息整則不處理。
+// Eligible 回傳訊息是否有圖片（圖片附件或圖片網址，見 ImageSources），且不含非圖片附件。
+// 純文字、只有一般網頁連結的訊息不是；含任何非圖片附件的訊息整則不是（就算有圖片網址）。
 func Eligible(m *discordgo.Message) bool {
-	if m == nil || len(m.Attachments) == 0 {
-		return false
-	}
-	for _, a := range m.Attachments {
-		if !IsImageAttachment(a) {
-			return false
-		}
-	}
-	return true
+	srcs, ok := ImageSources(m)
+	return ok && len(srcs) > 0
 }
 
 // 圖片尺寸上限：超過就不解碼（避免小檔案宣告超大尺寸耗盡記憶體）。

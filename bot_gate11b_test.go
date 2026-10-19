@@ -13,7 +13,7 @@ func TestGK11b_OnReadyNilGuildsSkipsPrune(t *testing.T) {
 	f, st := newLoadedStore(t, "g1", "c1")
 	sent := len(f.Sent)
 	r := &recordScanner{done: make(chan struct{}, 1)}
-	onReady(r, st)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{nil}})
+	onReady(r, st, false)(nil, &discordgo.Ready{Guilds: []*discordgo.Guild{nil}})
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):

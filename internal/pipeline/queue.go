@@ -150,6 +150,11 @@ func (p *Pipeline) run(j *job) error {
 		return nil
 	}
 	p.unreact(m, reactionProcessing)
+	if errors.Is(err, errNoImages) {
+		// 例如補處理重讀後網址被編輯掉、附件被移除：不發、不刪、不加 ❌。
+		log.Printf("訊息 %s/%s 沒有要處理的圖片，不處理", m.ChannelID, m.ID)
+		return nil
+	}
 	if j.ctx.Err() == nil {
 		p.react(m, reactionFailed)
 	}
