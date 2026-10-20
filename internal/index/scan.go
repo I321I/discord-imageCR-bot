@@ -2,9 +2,10 @@ package index
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net/http"
 	"slices"
-	"strings"
 	"sync"
 
 	"discordbot/internal/recognize"
@@ -38,15 +39,18 @@ const (
 
 // ScanChannel 由新到舊分頁讀完頻道歷史：
 //   - bot 自己的訊息 → PutImageMessage（不是圖片訊息的會被忽略）；
-//   - 其他 bot、webhook、沒有圖片或含非圖片附件的訊息 → 忽略（Q50）；
-//   - 使用者的帶圖訊息，ID 早於 setAt（snowflake 數值比較）→ 舊圖片訊息（PutLegacy）；
-//   - ID 晚於 setAt：帶有 bot 的 ❌（處理失敗過）→ 不補處理也不收錄（決定 10）；其他 → 讀完後由舊到新交給補處理。
+//   - 其他 bot、webhook、沒有圖片（圖片附件或圖片網址）或含非圖片附件的訊息 → 忽略（Q50）；
+//   - 使用者的帶圖訊息，不是新訊息（store.IsNewMessage：附件訊息早於 setAt；只含圖片網址的訊息早於
+//     max(setAt, urlSince)，U1）→ 舊圖片訊息（PutLegacy）；
+//   - 新訊息：帶有 bot 的 ❌（處理失敗過）→ 不補處理也不收錄（決定 10）；只有 gifv（新訊息不處理，U3）→ 忽略；
+//     其他 → 讀完後由舊到新交給補處理。
 //
 // setAt 不合法（空字串、非數字，設定資料損壞）時無法判斷先後：記 log，使用者的帶圖訊息一律當舊圖片訊息收錄、不補處理。
+// urlSince 不合法（尚未寫入）時，只含圖片網址的訊息一律當舊圖片訊息。
 //
 // 每讀完一頁就寫進索引（掃描期間搜尋回傳已建好的部分，Q52）。ctx 結束時停止並回錯誤，不交給補處理。
 // 交給 bf 時傳入的也是 ctx；ctx 會在掃描結束後取消時，bf 要自行改用不會隨掃描結束而取消的 ctx（見 Hooks）。
-func ScanChannel(ctx context.Context, api API, x Writer, bf Backfiller, botID, guildID, channelID, setAt string) error {
+func ScanChannel(ctx context.Context, api API, x Writer, bf Backfiller, botID, guildID, channelID, setAt, urlSince string) error {
 	validSetAt := snowflake.Valid(setAt)
 	if !validSetAt {
 		log.Printf("頻道 %s 的設定時間點 %q 不合法，使用者圖片一律當舊圖片訊息收錄、不補處理", channelID, setAt)
@@ -70,9 +74,10 @@ func ScanChannel(ctx context.Context, api API, x Writer, bf Backfiller, botID, g
 			case m.Author.ID == botID:
 				x.PutImageMessage(guildID, m)
 			case m.Author.Bot || m.WebhookID != "" || !recognize.Eligible(m):
-			case !validSetAt || snowflake.Less(m.ID, setAt):
+			case !store.IsNewMessage(m.ID, setAt, urlSince, len(m.Attachments) == 0):
 				x.PutLegacy(guildID, m)
 			case hasOwnReaction(m, reactionFailed):
+			case !hasNewMessageSources(m):
 			default:
 				backfill = append(backfill, m)
 			}
@@ -90,6 +95,12 @@ func ScanChannel(ctx context.Context, api API, x Writer, bf Backfiller, botID, g
 		bf.EnqueueBackfill(ctx, guildID, m)
 	}
 	return nil
+}
+
+// hasNewMessageSources 回傳訊息是否有新訊息要處理的圖片（不含 gifv，U3）。
+func hasNewMessageSources(m *discordgo.Message) bool {
+	srcs, ok := recognize.NewMessageSources(m)
+	return ok && len(srcs) > 0
 }
 
 // hasOwnReaction 回傳訊息上是否有 bot 自己加的 emoji 反應。
@@ -119,6 +130,49 @@ type Hooks struct {
 	// putMu 讓「確認仍是來源頻道再寫入」與 ChannelRemoved 的清除互斥：
 	// 設定先移除頻道才呼叫 ChannelRemoved，所以寫入要嘛在清除之前（會被清掉），要嘛看得到頻道已移除。
 	putMu sync.Mutex
+
+	// refetchMu 保護 refetching：MessageUpdated 處理中（含重讀）的訊息（"channelID/messageID" → 進行中的處理）。
+	// 訊息在重讀期間被刪除時標記，寫回前檢查，避免把已刪除的訊息寫回索引（把關後決定 (c)）。
+	// 鎖順序：putMu → refetchMu。
+	refetchMu  sync.Mutex
+	refetching map[string][]*refetchToken
+}
+
+// refetchToken 是一次進行中的重讀；deleted 由 refetchMu 保護。
+type refetchToken struct{ deleted bool }
+
+func refetchKey(channelID, messageID string) string { return channelID + "/" + messageID }
+
+// startRefetch 登記一次重讀，回傳登記與取消登記的函式。
+func (h *Hooks) startRefetch(channelID, messageID string) (*refetchToken, func()) {
+	k := refetchKey(channelID, messageID)
+	tok := &refetchToken{}
+	h.refetchMu.Lock()
+	if h.refetching == nil {
+		h.refetching = map[string][]*refetchToken{}
+	}
+	h.refetching[k] = append(h.refetching[k], tok)
+	h.refetchMu.Unlock()
+	return tok, func() {
+		h.refetchMu.Lock()
+		defer h.refetchMu.Unlock()
+		toks := slices.DeleteFunc(h.refetching[k], func(t *refetchToken) bool { return t == tok })
+		if len(toks) == 0 {
+			delete(h.refetching, k)
+		} else {
+			h.refetching[k] = toks
+		}
+	}
+}
+
+// removeMessage 移除訊息的索引項目，並標記該訊息進行中的重讀（結果不寫回）。
+func (h *Hooks) removeMessage(channelID, messageID string) {
+	h.refetchMu.Lock()
+	defer h.refetchMu.Unlock()
+	for _, t := range h.refetching[refetchKey(channelID, messageID)] {
+		t.deleted = true
+	}
+	h.x.RemoveMessage(channelID, messageID)
 }
 
 // shutdownBackfiller 把補處理排入佇列時改用 bot 關機 ctx：掃描用的 ctx 在掃描結束時就會取消，
@@ -236,7 +290,9 @@ func (h *Hooks) startScan(channelID string) chan struct{} {
 	ctx, cancel := context.WithCancel(h.ctx)
 	s := &scan{cancel: cancel, done: make(chan struct{})}
 	h.mu.Lock()
-	guildID, setAt, ok := h.store.Snapshot().SourceChannel(channelID)
+	d := h.store.Snapshot()
+	urlSince := d.URLSince
+	guildID, setAt, ok := d.SourceChannel(channelID)
 	if !ok {
 		h.mu.Unlock()
 		cancel()
@@ -259,7 +315,7 @@ func (h *Hooks) startScan(channelID string) chan struct{} {
 		if old != nil {
 			<-old.done
 		}
-		if err := ScanChannel(ctx, h.api, sourceWriter{h}, bf, botID, guildID, channelID, setAt); err != nil && ctx.Err() == nil {
+		if err := ScanChannel(ctx, h.api, sourceWriter{h}, bf, botID, guildID, channelID, setAt, urlSince); err != nil && ctx.Err() == nil {
 			log.Printf("掃描頻道 %s 失敗：%v", channelID, err)
 		}
 		h.mu.Lock()
@@ -290,50 +346,85 @@ func (h *Hooks) stopScan(channelID string) bool {
 	return true
 }
 
-// MessageDeleted 移除被刪除訊息的索引項目。
+// MessageDeleted 移除被刪除訊息的索引項目（進行中的重讀結果不再寫回）。
 func (h *Hooks) MessageDeleted(channelID, messageID string) {
-	h.x.RemoveMessage(channelID, messageID)
+	h.removeMessage(channelID, messageID)
 }
 
-// MessagesDeleted 移除批次刪除的訊息的索引項目。
+// MessagesDeleted 移除批次刪除的訊息的索引項目（進行中的重讀結果不再寫回）。
 func (h *Hooks) MessagesDeleted(channelID string, messageIDs []string) {
 	for _, id := range messageIDs {
-		h.x.RemoveMessage(channelID, id)
+		h.removeMessage(channelID, id)
 	}
 }
 
+// messageGetter 是重讀單則訊息的方法（*discordgo.Session、discordtest.Fake 都有）。
+type messageGetter interface {
+	ChannelMessage(channelID, messageID string, options ...discordgo.RequestOption) (*discordgo.Message, error)
+}
+
 // MessageUpdated 依編輯後的訊息更新索引：來源頻道中 bot 的圖片訊息重新收錄；
-// 設定時間點之前的使用者帶圖訊息（舊圖片訊息）重新收錄，沒有文字或不再是圖片訊息則移除。
+// 舊圖片訊息（不是新訊息的使用者帶圖訊息，見 store.IsNewMessage）重新收錄，沒有文字或不再有圖片則移除。
 // 設定時間點不合法時，使用者訊息一律視為舊圖片訊息（同掃描）。
-// 其他訊息（含設定時間點之後、等待處理或處理失敗的原訊息）不動。
-// 使用者訊息的更新沒有附件資訊（Attachments 為 nil）時：有文字 → 保留既有附件、只更新已收錄舊圖片訊息的文字；
-// 沒有文字 → 無法判斷，不動。附件確定被清空（空陣列）才移除。
-// 寫入在 putMu 下確認頻道仍是來源（同 PutImageMessage）。
+// 其他訊息（含新訊息：等待處理或處理失敗的原訊息）不動。
+// 使用者訊息的更新是部分的（Attachments 或 Embeds 為 nil）時，在 putMu 之外重讀完整訊息再判斷：
+// 404 → 移除；其他錯誤 → 記 log、不動。處理期間（含重讀、完整更新）收到該訊息的刪除事件 → 不寫回。
+// 寫入在 putMu 下重新確認頻道仍是來源（同 PutImageMessage）。
 func (h *Hooks) MessageUpdated(m *discordgo.Message) {
 	if m == nil || m.Author == nil {
 		return
 	}
-	botID := h.BotID()
-	h.putMu.Lock()
-	defer h.putMu.Unlock()
-	guildID, setAt, ok := h.store.Snapshot().SourceChannel(m.ChannelID)
-	if !ok {
+	if botID := h.BotID(); botID != "" && m.Author.ID == botID {
+		h.putMu.Lock()
+		defer h.putMu.Unlock()
+		if guildID, _, ok := h.store.Snapshot().SourceChannel(m.ChannelID); ok {
+			h.x.PutImageMessage(guildID, m)
+		}
 		return
 	}
-	switch {
-	case botID != "" && m.Author.ID == botID:
-		h.x.PutImageMessage(guildID, m)
-	case m.Author.Bot || m.WebhookID != "":
-	case snowflake.Valid(setAt) && !snowflake.Less(m.ID, setAt):
-	case m.Attachments == nil:
-		// 沒有附件資訊（部分更新）：無法判斷附件是否被移除，保留既有附件。
-		if text := strings.TrimSpace(m.Content); text != "" {
-			h.x.UpdateLegacyText(m.ChannelID, m.ID, text)
+	if m.Author.Bot || m.WebhookID != "" {
+		return
+	}
+	d := h.store.Snapshot()
+	_, setAt, ok := d.SourceChannel(m.ChannelID)
+	if !ok || store.IsNewMessage(m.ID, setAt, d.URLSince, true) {
+		return // 不是來源頻道，或不論有沒有附件都是新訊息
+	}
+	// 登記處理中（含不需重讀的完整更新）：處理途中收到刪除事件時不寫回。
+	tok, done := h.startRefetch(m.ChannelID, m.ID)
+	defer done()
+	if m.Attachments == nil || m.Embeds == nil {
+		getter, ok := h.api.(messageGetter)
+		if !ok {
+			return
 		}
-	default:
-		h.x.RemoveMessage(m.ChannelID, m.ID)
-		if recognize.Eligible(m) {
-			h.x.PutLegacy(guildID, m)
+		fresh, err := getter.ChannelMessage(m.ChannelID, m.ID)
+		if err != nil {
+			var rest *discordgo.RESTError
+			if errors.As(err, &rest) && rest.Response != nil && rest.Response.StatusCode == http.StatusNotFound {
+				h.x.RemoveMessage(m.ChannelID, m.ID)
+				return
+			}
+			log.Printf("重讀訊息 %s/%s 失敗，索引不更新：%v", m.ChannelID, m.ID, err)
+			return
 		}
+		m = fresh
+	}
+	h.putMu.Lock()
+	defer h.putMu.Unlock()
+	d = h.store.Snapshot()
+	guildID, setAt, ok := d.SourceChannel(m.ChannelID)
+	if !ok || store.IsNewMessage(m.ID, setAt, d.URLSince, len(m.Attachments) == 0) {
+		return
+	}
+	// 處理期間（含重讀）訊息被刪除就不寫回；檢查與寫入在 refetchMu 內，與 MessageDeleted 互斥。
+	h.refetchMu.Lock()
+	defer h.refetchMu.Unlock()
+	if tok.deleted {
+		return
+	}
+	h.x.RemoveMessage(m.ChannelID, m.ID)
+	if recognize.Eligible(m) {
+		h.x.PutLegacy(guildID, m)
 	}
 }

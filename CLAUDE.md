@@ -4,7 +4,7 @@
 
 ## 專案概況
 
-動畫截圖圖庫 bot：在「圖庫頻道」（來源頻道）自動辨識使用者貼的圖片（trace.moe 查作品、RapidOCR 讀圖片文字），重新發成「圖片＋固定格式文字」的圖片訊息並刪除原訊息；使用者可用 `/search` 在任何地方搜尋並貼出圖片。設計與規劃：`docs/superpowers/specs/2026-10-12-image-bot-design.md`、`docs/plans/2026-10-12-image-bot.md`。
+動畫截圖圖庫 bot：在「圖庫頻道」（來源頻道）自動辨識使用者貼的圖片（圖片附件或圖片網址；trace.moe 查作品、RapidOCR 讀圖片文字），重新發成「圖片＋固定格式文字」的圖片訊息並刪除原訊息；使用者可用 `/search` 在任何地方搜尋並貼出圖片。設計與規劃：`docs/superpowers/specs/2026-10-12-image-bot-design.md`、`docs/plans/2026-10-12-image-bot.md`；圖片網址支援：`docs/plans/2026-10-19-image-url.md`。
 
 - 語言與依賴：Go 1.27（module `discordbot`）、discordgo v0.29.0、godotenv、`golang.org/x/image`；OCR worker 為 Python 3.12（`ocr/requirements.txt` 全部鎖定版本）。
 - 全部免費：不得引入付費 API。
@@ -17,9 +17,9 @@
 | `internal/config` | 讀環境變數 |
 | `internal/store` | 設定資料模型、分段編碼、讀寫儲存頻道（mutex 保護） |
 | `internal/imagemsg` | 圖片訊息的格式化、解析、分隔符號正規化、2000 字截斷 |
-| `internal/recognize` | 附件判定與解碼、trace.moe、OCR 前處理與組行、RapidOCR worker 管理、排隊（含優先） |
-| `internal/pipeline` | 來源頻道新訊息的佇列與處理流程（下載、辨識、發出、刪原訊息、⏳／❌） |
-| `internal/index` | 記憶體搜尋索引、啟動掃描與補處理、訊息刪除／編輯時更新 |
+| `internal/recognize` | 附件判定與解碼、訊息中的圖片清單（附件＋圖片網址，`imageurl.go`）、trace.moe、OCR 前處理與組行、RapidOCR worker 管理、排隊（含優先） |
+| `internal/pipeline` | 來源頻道新訊息的佇列與處理流程（下載、辨識、發出、刪原訊息、⏳／❌）、等待預覽與訊息更新觸發、防 SSRF 的網址下載器 `URLFetcher`（`urlfetch.go`） |
+| `internal/index` | 記憶體搜尋索引（Key `c:m:N` 附件圖、`c:m:uN` 網址圖）、啟動掃描與補處理、訊息刪除／編輯時更新（部分更新會重讀完整訊息） |
 | `internal/access` | 頻道權限計算（移植 discordgo）、成員快取、可用頻道判定 |
 | `internal/commands` | interaction 分派與各指令 |
 | `internal/snowflake` | snowflake 數值比較 |
@@ -31,7 +31,7 @@
 ### 指令
 
 - `/channel add | remove | list`：設定此伺服器的圖庫頻道（伺服器安裝、需「管理伺服器」，回覆 ephemeral）
-- `/search`：搜尋並公開貼出圖片（使用者安裝，伺服器與私訊皆可，autocomplete）
+- `/search`：搜尋並公開貼出圖片（使用者安裝，伺服器與私訊皆可，autocomplete）；網址圖不重新上傳，見下方「圖片網址」
 - `/sources`：勾選 `/search` 要搜尋的圖庫頻道（使用者安裝）
 - 右鍵訊息「編輯圖片訊息」「重新辨識」（伺服器安裝；對帶 ❌ 的原訊息「重新辨識」會重新處理整則）
 - `/storage show | reload | save`：開發者專用，只註冊在 `SERVER_ID` 伺服器
@@ -47,7 +47,16 @@
 ### 資料存放
 
 - 設定（各伺服器的來源頻道與設定時間點、各使用者勾選的頻道）以 JSON 存成**儲存頻道中的訊息**，每次變動發一則新的完整版本，超過 2000 字拆成多則；不得寫檔。啟動時讀最新完整版本，讀取失敗則記 log 以空資料啟動。
+- 設定資料另有全域欄位 `url_since`（圖片網址功能上線時間點，snowflake）：設定成功讀取時於第一次 READY 後寫入，值為寫入儲存頻道時 Discord 回傳的訊息 ID（不用本機時鐘）；寫入失敗或以空資料啟動時不寫。
 - 圖片資料就是頻道中的圖片訊息本身；搜尋索引只在記憶體，啟動（及重新 IDENTIFY）時讀頻道歷史重建，並補處理離線期間的圖片。
+
+### 圖片網址
+
+- 圖片網址：訊息文字中的 http/https 連結，路徑副檔名為 png/jpg/jpeg/webp/gif，或 Discord 預覽為圖片（type image/gifv，或預覽的 image/thumbnail 就是該網址）；`<網址>`、`||網址||`、`[文字](網址)` 都算，同一網址算一張；附件在前、網址在後一起編號。一般網頁連結不處理；含非圖片附件的訊息整則不處理。搜尋文字一律去掉圖片網址。
+- 新舊區分（`store.IsNewMessage`）：有附件的訊息只看設定時間點；只含圖片網址的看 max(設定時間點, `url_since`)。舊的只收進搜尋。
+- 新訊息：下載網址圖（gifv 不處理），須能解碼成 PNG/JPEG/GIF/WEBP，重新上傳；任一張失敗一張都不發、加 ❌。含尚無預覽的連結時等 5 秒重讀；MESSAGE_UPDATE（預覽補上、編輯加網址）也會觸發。重讀後沒有圖片 → 不發、不刪、不加 ❌（`ErrNoImages`）。
+- `URLFetcher` 安全規則（不可放寬）：只 http/https、不帶帳密；只連公開位址的 80、443，在 `net.Dialer.Control` 以實際連線 IP 檢查（含每一跳轉址，最多 5 跳；擋私有／保留／內嵌 IPv4 的 IPv6 過渡位址）；`Proxy: nil`；25MiB、逾時 2 分鐘。測試用 `newURLFetcher(check)` 放行 httptest。
+- `/search` 網址圖：同附件排隊；重讀訊息確認網址仍在原位置，以 `URLFetcher.Check`（15 秒）檢查：確定已刪除（404/410/imgur removed.png）或確定不是圖片 → 回「圖床上的圖片已被刪除」並移除索引；內容確定為四種點陣格式 → 貼出網址（不重新上傳，mention 不通知）；其他（無法確認，`ErrUnconfirmedImage` 等）→ 只有 Discord 對該網址有圖片預覽才貼出，否則回「目前無法確認圖片」（防釣魚）。
 
 ### OCR worker
 

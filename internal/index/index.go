@@ -1,5 +1,5 @@
 // Package index 是圖片訊息與舊圖片訊息的記憶體索引（供 /search），以及啟動時讀頻道歷史建立索引與補處理。
-// 索引只存文字與 ID，不存圖片與附件網址（貼圖前重新抓訊息取得新網址）。
+// 索引只存文字與 ID，不存圖片與附件網址（貼圖前重新抓訊息取得新網址）；網址圖另存使用者貼的網址（貼圖前重新抓訊息確認仍在）。
 package index
 
 import (
@@ -33,18 +33,22 @@ const maxKeyLen = 100
 // Key 指向一則訊息中的一張圖。圖片訊息的 Attachment 一律為 0。
 type Key struct {
 	ChannelID, MessageID string
-	Attachment           int
+	Attachment           int  // 附件圖：附件在訊息中的位置；網址圖：在 recognize.Links(訊息文字) 中的位置
+	Link                 bool // 網址圖
 }
 
-// String 回傳 "channelID:messageID:attachment"。
+// String 回傳 "channelID:messageID:attachment"（附件圖，與舊格式相同）或 "channelID:messageID:uN"（網址圖）。
 func (k Key) String() string {
+	if k.Link {
+		return fmt.Sprintf("%s:%s:u%d", k.ChannelID, k.MessageID, k.Attachment)
+	}
 	return fmt.Sprintf("%s:%s:%d", k.ChannelID, k.MessageID, k.Attachment)
 }
 
 // ErrBadKey 表示字串不是合法的 Key。
 var ErrBadKey = errors.New("invalid index key")
 
-// ParseKey 解析 Key.String 的結果；頻道與訊息 ID 必須是數字、附件序號 ≥ 0、總長 ≤ 100。
+// ParseKey 解析 Key.String 的結果；頻道與訊息 ID 必須是數字、附件序號 ≥ 0（網址圖為 "u" 加上十進位數字）、總長 ≤ 100。
 func ParseKey(s string) (Key, error) {
 	if len(s) > maxKeyLen {
 		return Key{}, ErrBadKey
@@ -58,11 +62,15 @@ func ParseKey(s string) (Key, error) {
 			return Key{}, ErrBadKey
 		}
 	}
-	n, err := strconv.Atoi(parts[2])
+	pos, link := strings.CutPrefix(parts[2], "u")
+	if link && (pos == "" || strings.TrimLeft(pos, "0123456789") != "") {
+		return Key{}, ErrBadKey
+	}
+	n, err := strconv.Atoi(pos)
 	if err != nil || n < 0 {
 		return Key{}, ErrBadKey
 	}
-	return Key{ChannelID: parts[0], MessageID: parts[1], Attachment: n}, nil
+	return Key{ChannelID: parts[0], MessageID: parts[1], Attachment: n, Link: link}, nil
 }
 
 // Entry 是索引中的一張圖。
@@ -71,10 +79,11 @@ type Entry struct {
 	GuildID         string
 	Kind            Kind
 	Fields          imagemsg.Fields // KindImageMessage
-	LegacyText      string          // KindLegacy：原訊息整段文字
-	AttachmentCount int             // 該訊息的圖片附件數
-	Number          int             // 這張圖是該訊息的第幾張圖片（1 起，只計圖片附件）
-	AttachmentID    string          // 收錄時的附件 ID（貼圖前比對，確認附件沒被換掉）
+	LegacyText      string          // KindLegacy：原訊息文字（去掉圖片網址）
+	AttachmentCount int             // 該訊息的圖片數（圖片附件與圖片網址）
+	Number          int             // 這張圖是該訊息的第幾張圖片（1 起；附件在前、網址在後）
+	AttachmentID    string          // 附件圖：收錄時的附件 ID（貼圖前比對，確認附件沒被換掉）
+	ImageURL        string          // 網址圖：要貼出的網址；附件圖為空
 }
 
 // Index 是並行安全的記憶體索引。
@@ -145,31 +154,40 @@ func (x *Index) PutImageMessage(guildID string, m *discordgo.Message) {
 	x.set(m.ChannelID, m.ID, []stored{newStored(e)})
 }
 
-// PutLegacy 收錄（或更新）一則舊圖片訊息：每張圖一筆，文字為原訊息整段文字；沒有文字則不收錄。
-// 張數與編號只計圖片附件；Key.Attachment 是附件在訊息中的位置（含非圖片附件）。
+// PutLegacy 收錄（或更新）一則舊圖片訊息：每張圖（圖片附件與圖片網址）一筆，文字為原訊息去掉圖片網址後的文字；
+// 沒有文字或沒有圖片則不收錄（不動既有項目）。非圖片附件略過（呼叫端以 recognize.Eligible 決定是否收錄整則）。
+// 張數與編號依來源順序（圖片附件在前、圖片網址在後，同 recognize.ImageSources）；
+// Key.Attachment 是附件在訊息中的位置（含非圖片附件），或網址在 recognize.Links 中的位置。
 func (x *Index) PutLegacy(guildID string, m *discordgo.Message) {
 	if m == nil {
 		return
 	}
-	text := strings.TrimSpace(m.Content)
+	text := recognize.TextWithoutImageURLs(m)
 	if text == "" {
 		return
 	}
-	var entries []stored
+	var srcs []recognize.ImageSource
 	for i, a := range m.Attachments {
-		if !recognize.IsImageAttachment(a) {
-			continue
+		if recognize.IsImageAttachment(a) {
+			srcs = append(srcs, recognize.ImageSource{Attachment: a, Index: i})
 		}
-		entries = append(entries, newStored(Entry{
-			Key:     Key{ChannelID: m.ChannelID, MessageID: m.ID, Attachment: i},
-			GuildID: guildID, Kind: KindLegacy, LegacyText: text, Number: len(entries) + 1, AttachmentID: a.ID,
-		}))
 	}
-	if len(entries) == 0 {
+	srcs = append(srcs, recognize.LinkSources(m)...)
+	if len(srcs) == 0 {
 		return
 	}
-	for i := range entries {
-		entries[i].e.AttachmentCount = len(entries)
+	entries := make([]stored, 0, len(srcs))
+	for i, src := range srcs {
+		e := Entry{
+			Key:     Key{ChannelID: m.ChannelID, MessageID: m.ID, Attachment: src.Index, Link: src.IsLink()},
+			GuildID: guildID, Kind: KindLegacy, LegacyText: text, AttachmentCount: len(srcs), Number: i + 1,
+		}
+		if src.IsLink() {
+			e.ImageURL = src.URL
+		} else {
+			e.AttachmentID = src.Attachment.ID
+		}
+		entries = append(entries, newStored(e))
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -255,7 +273,7 @@ type hit struct {
 	rank int
 }
 
-// before 回傳 a 是否排在 b 前面（Q37）：等級 → 訊息由新到舊 → 頻道 ID → 附件序號。
+// before 回傳 a 是否排在 b 前面（Q37）：等級 → 訊息由新到舊 → 頻道 ID → 同一訊息內的編號。
 func (a hit) before(b hit) bool {
 	if a.rank != b.rank {
 		return a.rank < b.rank
@@ -266,7 +284,7 @@ func (a hit) before(b hit) bool {
 	if a.e.Key.ChannelID != b.e.Key.ChannelID {
 		return a.e.Key.ChannelID < b.e.Key.ChannelID
 	}
-	return a.e.Key.Attachment < b.e.Key.Attachment
+	return a.e.Number < b.e.Number
 }
 
 // worstFirst 是以「排最後的」為頂端的 heap，用來只保留前 N 名。

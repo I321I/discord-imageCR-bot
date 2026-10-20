@@ -23,7 +23,7 @@ type job struct {
 	done    chan error
 }
 
-// Reprocess 被略過時的結果（一般 Enqueue、EnqueueBackfill 被略過時回 nil）。
+// Reprocess 被略過時的結果（一般 Enqueue、EnqueueBackfill 被略過時回 nil）；沒有圖片時另回 ErrNoImages。
 var (
 	// ErrAlreadyQueued 表示同一則訊息已在佇列中或處理中。
 	ErrAlreadyQueued = errors.New("message already queued")
@@ -47,7 +47,7 @@ func (p *Pipeline) EnqueueBackfill(ctx context.Context, guildID string, m *disco
 
 // Reprocess 重新處理帶 bot ❌ 的原訊息（對自己發的原訊息使用「重新辨識」）：先移除 ❌，再同 Enqueue 排入佇列
 // （下載、辨識、發出、全部成功才刪原訊息；失敗時重新加 ❌）。辨識以優先排隊（Q62）。
-// 已在佇列中或處理中 → ErrAlreadyQueued；輪到時頻道已非來源 → ErrNotSource。
+// 已在佇列中或處理中 → ErrAlreadyQueued；輪到時頻道已非來源 → ErrNotSource；沒有要處理的圖片（例如只剩 gifv）→ ErrNoImages（不加回 ❌）。
 // 部分成功過的訊息會重複發出已發過的圖（使用者決定，由使用者手動刪除）。
 // ctx 會跟著訊息留在佇列中，必須是 bot 關機才取消的 ctx。
 func (p *Pipeline) Reprocess(ctx context.Context, guildID string, m *discordgo.Message) <-chan error {
@@ -150,6 +150,14 @@ func (p *Pipeline) run(j *job) error {
 		return nil
 	}
 	p.unreact(m, reactionProcessing)
+	if errors.Is(err, ErrNoImages) {
+		// 例如補處理重讀後網址被編輯掉、附件被移除、只剩 gifv：不發、不刪、不加 ❌。
+		log.Printf("訊息 %s/%s 沒有要處理的圖片，不處理", m.ChannelID, m.ID)
+		if j.strict {
+			return err
+		}
+		return nil
+	}
 	if j.ctx.Err() == nil {
 		p.react(m, reactionFailed)
 	}

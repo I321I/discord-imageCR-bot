@@ -115,6 +115,17 @@ func (f *Fake) AddMessage(m *discordgo.Message) *discordgo.Message {
 	return m
 }
 
+// ReplaceMessage 以 m 取代頻道中同 ID 的訊息（模擬訊息被編輯、預覽補上）；不存在時同 AddMessage 新增。
+func (f *Fake) ReplaceMessage(m *discordgo.Message) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i, old := f.find(m.ChannelID, m.ID); old != nil {
+		f.messages[m.ChannelID][i] = m
+		return
+	}
+	f.insert(m)
+}
+
 func (f *Fake) insert(m *discordgo.Message) {
 	arr := append(f.messages[m.ChannelID], m)
 	sort.SliceStable(arr, func(a, b int) bool { return idLess(arr[a].ID, arr[b].ID) })

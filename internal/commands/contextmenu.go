@@ -37,6 +37,7 @@ const (
 	msgPermissionUnknown = "目前無法確認權限，請稍後再試"
 	msgRestarting        = "機器人正在重新啟動，請稍後再試"
 	msgNotSource         = "這個頻道已不是圖庫頻道"
+	msgNoImages          = "這則訊息沒有可處理的圖片" // 帶 ❌ 但只剩 gifv 等新訊息不處理的內容（使用者決定）
 )
 
 const (
@@ -427,7 +428,7 @@ func (c *ContextMenu) editMessage(m *discordgo.Message, content string) bool {
 
 // Rerecognize 是「重新辨識」的 handler。
 //   - bot 的圖片訊息：只重跑標失敗的作品、圖片文字（沒有則提示）；
-//   - 使用者自己發、帶 bot ❌ 的原訊息：重新處理整則（同自動處理流程）；
+//   - 使用者自己發、帶 bot ❌ 的原訊息（圖片附件或圖片網址）：重新處理整則（同自動處理流程，網址圖重新下載）；
 //   - 其他訊息：提示只能對圖片訊息使用。
 func (c *ContextMenu) Rerecognize(ctx context.Context, i *discordgo.InteractionCreate) {
 	m := targetMessage(i)
@@ -572,6 +573,9 @@ func (c *ContextMenu) reprocessOriginal(ctx context.Context, i *discordgo.Intera
 	case err == nil:
 	case errors.Is(err, pipeline.ErrAlreadyQueued):
 		editResponse(c.API, i, msgAlreadyQueued)
+		return
+	case errors.Is(err, pipeline.ErrNoImages):
+		editResponse(c.API, i, msgNoImages)
 		return
 	case errors.Is(err, pipeline.ErrNotSource):
 		// 排隊期間頻道已不是來源（原訊息不補回 ❌）。
