@@ -7,6 +7,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io/fs"
+	"os"
 	"slices"
 	"sync"
 	"testing"
@@ -425,7 +427,8 @@ func TestRecognizeWithFallback_ZeroSizeBoxIsNotVertical(t *testing.T) {
 	}
 }
 
-// 10/28 Task 4：字幕區有文字框碰到上緣（y.lo ≤ subtitleTopEdgePx）→ 字幕區切到畫面中的文字（例如直書漫畫的半欄），改辨識整張。
+// 10/28 追加修正：字幕區有文字框的上緣落在字幕區高度上方 20% 以內（y.lo ≤ subtitleTopRegionRatio × 高度）
+// → 字幕區切到畫面中的文字（例如直書漫畫的最後一字），改辨識整張。
 func TestRecognizeWithFallback_BoxTouchingTopUsesWhole(t *testing.T) {
 	s := &scriptedItems{results: [][]OCRItem{
 		{rectItem("是", 100, 0, 30, 30)}, // 正方形框（不是直書）碰到上緣
@@ -440,27 +443,39 @@ func TestRecognizeWithFallback_BoxTouchingTopUsesWhole(t *testing.T) {
 	}
 }
 
-func TestRecognizeWithFallback_BoxNearTopWithinThreshold(t *testing.T) {
-	if subtitleTopEdgePx != 2 {
-		t.Errorf("門檻 %v，預期 2（Q6）", subtitleTopEdgePx)
+// 高度 152：0.2 × 152 = 30.4，y.lo = 30 在上方 20% 以內。
+func TestRecognizeWithFallback_BoxWithinTopRegionUsesWhole(t *testing.T) {
+	if subtitleTopRegionRatio != 0.2 {
+		t.Errorf("比例 %v，預期 0.2", subtitleTopRegionRatio)
 	}
 	s := &scriptedItems{results: [][]OCRItem{
-		{rectItem("字幕", 0, 40, 60, 20), rectItem("是", 100, 2, 30, 30)},
+		{rectItem("字幕", 0, 80, 60, 20), rectItem("是", 100, 30, 30, 30)},
 		{rectItem("整張", 0, 10, 60, 20)},
 	}}
 	if got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White)); err != nil || got != "整張" {
-		t.Fatalf("y.lo = 2 應改用整張，得到 %q %v", got, err)
+		t.Fatalf("y.lo = 30（高度 152）應改用整張，得到 %q %v", got, err)
 	}
 }
 
-func TestRecognizeWithFallback_BoxBelowTopKept(t *testing.T) {
-	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 3, 60, 20)}}}
+func TestRecognizeWithFallback_BoxBelowTopRegionKept(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 31, 60, 20)}}}
 	got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White))
 	if err != nil || got != "字幕" {
-		t.Fatalf("y.lo = 3 應保留字幕區結果，得到 %q %v", got, err)
+		t.Fatalf("y.lo = 31（高度 152）應保留字幕區結果，得到 %q %v", got, err)
 	}
 	if len(s.sizes) != 1 {
 		t.Errorf("不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+// 門檻依字幕區影像高度計算：同樣 y.lo = 31，高度 160（門檻 32）就觸發。
+func TestRecognizeWithFallback_TopRegionUsesSubtitleHeight(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{
+		{rectItem("字幕", 0, 31, 60, 20)},
+		{rectItem("整張", 0, 10, 60, 20)},
+	}}
+	if got, err := RecognizeWithFallback(context.Background(), s, solid(640, 160, color.White), solid(1280, 874, color.White)); err != nil || got != "整張" {
+		t.Fatalf("y.lo = 31（高度 160）應改用整張，得到 %q %v", got, err)
 	}
 }
 
@@ -478,23 +493,57 @@ func TestRecognizeWithFallback_BlankBoxAtTopIgnored(t *testing.T) {
 
 func TestSubtitleTouchesTop(t *testing.T) {
 	cases := []struct {
-		name  string
-		items []OCRItem
-		want  bool
+		name   string
+		items  []OCRItem
+		height int
+		want   bool
 	}{
-		{"沒有框", nil, false},
-		{"y.lo = 0", []OCRItem{rectItem("a", 0, 0, 10, 10)}, true},
-		{"y.lo = 2", []OCRItem{rectItem("a", 0, 2, 10, 10)}, true},
-		{"y.lo = 2.5", []OCRItem{rectItem("a", 0, 2.5, 10, 10)}, false},
-		{"y.lo = 3", []OCRItem{rectItem("a", 0, 3, 10, 10)}, false},
-		{"負座標", []OCRItem{rectItem("a", 0, -1, 10, 10)}, true},
-		{"空白文字", []OCRItem{rectItem("  ", 0, 0, 10, 10)}, false},
-		{"任一框碰到", []OCRItem{rectItem("a", 0, 30, 10, 10), rectItem("b", 20, 1, 10, 10)}, true},
+		{"沒有框", nil, 152, false},
+		{"y.lo = 0", []OCRItem{rectItem("a", 0, 0, 10, 10)}, 152, true},
+		{"y.lo = 5", []OCRItem{rectItem("a", 0, 5, 10, 10)}, 152, true},
+		{"y.lo = 30", []OCRItem{rectItem("a", 0, 30, 10, 10)}, 152, true},
+		{"y.lo = 30.4（剛好 20%）", []OCRItem{rectItem("a", 0, 30.4, 10, 10)}, 152, true},
+		{"y.lo = 30.5", []OCRItem{rectItem("a", 0, 30.5, 10, 10)}, 152, false},
+		{"y.lo = 31", []OCRItem{rectItem("a", 0, 31, 10, 10)}, 152, false},
+		{"高度 100、y.lo = 20", []OCRItem{rectItem("a", 0, 20, 10, 10)}, 100, true},
+		{"高度 100、y.lo = 21", []OCRItem{rectItem("a", 0, 21, 10, 10)}, 100, false},
+		{"負座標", []OCRItem{rectItem("a", 0, -1, 10, 10)}, 152, true},
+		{"空白文字", []OCRItem{rectItem("  ", 0, 0, 10, 10)}, 152, false},
+		{"任一框碰到", []OCRItem{rectItem("a", 0, 80, 10, 10), rectItem("b", 20, 1, 10, 10)}, 152, true},
+		{"高度 0 不判斷", []OCRItem{rectItem("a", 0, 0, 10, 10)}, 0, false},
+		{"負高度不判斷", []OCRItem{rectItem("a", 0, -5, 10, 10)}, -1, false},
 	}
 	for _, c := range cases {
-		if got := subtitleTouchesTop(c.items); got != c.want {
+		if got := subtitleTouchesTop(c.items, c.height); got != c.want {
 			t.Errorf("%s：subtitleTouchesTop = %v，預期 %v", c.name, got, c.want)
 		}
+	}
+}
+
+// 10/28 追加修正的回歸測試（不需要 OCR）：manga_vertical_bottom_edge.webp 的字幕區中「是」完整位於字幕區內、
+// 上緣約 y≈5px（PM 實測），原本 y.lo ≤ 2px 的條件不會觸發；改為上方 20% 後須觸發。缺圖時略過。
+func TestSubtitleTouchesTop_MangaVerticalBottomEdgeRegression(t *testing.T) {
+	data, err := os.ReadFile("testdata/manga_vertical_bottom_edge.webp")
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skip("找不到測試圖片 manga_vertical_bottom_edge.webp，略過")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := DecodeFirstFrame(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := PrepareForOCR(img)
+	h := sub.Bounds().Dy()
+	t.Logf("字幕區 %v", sub.Bounds().Size())
+	items := []OCRItem{rectItem("是", 300, 5, 30, 30)}
+	if !subtitleTouchesTop(items, h) {
+		t.Errorf("y.lo = 5（字幕區高度 %d）應觸發改辨識整張", h)
+	}
+	s := &scriptedItems{results: [][]OCRItem{items, {rectItem("整張", 0, 10, 60, 20)}}}
+	if got, err := RecognizeWithFallback(context.Background(), s, sub, PrepareWholeForOCR(img)); err != nil || got != "整張" {
+		t.Fatalf("應改用整張的結果，得到 %q %v", got, err)
 	}
 }
 

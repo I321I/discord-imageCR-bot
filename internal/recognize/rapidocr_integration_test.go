@@ -108,11 +108,20 @@ func TestRapidOCR_RealBlankImageIsNoText(t *testing.T) {
 	}
 }
 
-// 10/28 Task 4：記錄字幕區每個文字框的 y 範圍（縮放後字幕區像素），檢查「碰到上緣」門檻（subtitleTopEdgePx）。
-// manga_vertical_bottom_edge.webp 應碰到上緣、sub_pasted_cropped.png 不應；其餘只記錄（缺圖略過）。
+// 10/28 追加修正：記錄字幕區每個文字框的 y 範圍（縮放後字幕區像素）與頂端框上緣佔字幕區高度的比例，
+// 檢查「上方 20%」條件（subtitleTopRegionRatio）：manga_vertical_bottom_edge.webp 應觸發，所有 sub_* 與 tv_show 不應觸發（缺圖略過）。
 func TestRapidOCR_SubtitleTopEdge(t *testing.T) {
 	r := integrationOCR(t)
-	want := map[string]bool{"manga_vertical_bottom_edge.webp": true, "sub_pasted_cropped.png": false}
+	want := map[string]bool{
+		"manga_vertical_bottom_edge.webp": true,
+		"sub_pasted_cropped.png":          false,
+		"sub_fx_kurumi.webp":              false,
+		"sub_two_lines_right.png":         false,
+		"sub_phone_letterbox.webp":        false,
+		"sub_one_line.webp":               false,
+		"sub_japanese.webp":               false,
+		"tv_show.webp":                    false,
+	}
 	for _, file := range []string{
 		"manga_vertical_bottom_edge.webp", "sub_pasted_cropped.png", "sub_fx_kurumi.webp",
 		"sub_two_lines_right.png", "sub_phone_letterbox.webp", "sub_one_line.webp", "sub_japanese.webp", "tv_show.webp",
@@ -130,15 +139,26 @@ func TestRapidOCR_SubtitleTopEdge(t *testing.T) {
 				t.Fatal(err)
 			}
 			sub := PrepareForOCR(img)
+			h := sub.Bounds().Dy()
 			items, err := r.RecognizeItems(context.Background(), sub)
 			if err != nil && !errors.Is(err, ErrNoText) {
 				t.Fatal(err)
 			}
 			t.Logf("字幕區 %v", sub.Bounds().Size())
-			for _, b := range toBoxes(items) {
+			boxes := toBoxes(items)
+			for _, b := range boxes {
 				t.Logf("y %.1f–%.1f x %.1f–%.1f %q", b.y.lo, b.y.hi, b.x.lo, b.x.hi, b.text)
 			}
-			got := subtitleTouchesTop(items)
+			if len(boxes) > 0 {
+				top := boxes[0]
+				for _, b := range boxes[1:] {
+					if b.y.lo < top.y.lo {
+						top = b
+					}
+				}
+				t.Logf("頂端框 y.lo = %.1f，比例 %.3f（門檻 %.2f）%q", top.y.lo, top.y.lo/float64(h), subtitleTopRegionRatio, top.text)
+			}
+			got := subtitleTouchesTop(items, h)
 			t.Logf("subtitleTouchesTop = %v", got)
 			if w, ok := want[file]; ok && got != w {
 				t.Errorf("subtitleTouchesTop = %v，預期 %v", got, w)
