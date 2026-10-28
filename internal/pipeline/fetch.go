@@ -15,10 +15,12 @@ const MaxAttachmentSize = 25 << 20
 // ErrTooLarge 表示附件超過 MaxAttachmentSize。
 var ErrTooLarge = errors.New("attachment too large")
 
-// ErrSizeMismatch 表示下載到的長度與附件的 Size 不符（下載不完整），視為下載失敗。
-var ErrSizeMismatch = errors.New("downloaded size does not match attachment size")
+// ErrSizeMismatch 表示下載到的長度與 HTTP 回應的 Content-Length 不符（下載不完整），視為下載失敗。
+// （10/28：不再與附件的 Size 比對，Discord 回報的 Size 可能與實際檔案不同。）
+var ErrSizeMismatch = errors.New("downloaded size does not match Content-Length")
 
-// HTTPFetcher 以 HTTP GET 下載附件；內容超過 MaxBytes 時回 ErrTooLarge。
+// HTTPFetcher 以 HTTP GET 下載附件；內容超過 MaxBytes 時回 ErrTooLarge；
+// 回應有 Content-Length 而實際長度不符時回 ErrSizeMismatch（Transport 自動解壓時 ContentLength 為 -1，不比對）。
 type HTTPFetcher struct {
 	Client   *http.Client
 	MaxBytes int64
@@ -48,6 +50,9 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, url string) ([]byte, error) {
 	}
 	if int64(len(data)) > f.MaxBytes {
 		return nil, fmt.Errorf("%w：超過 %d bytes", ErrTooLarge, f.MaxBytes)
+	}
+	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
+		return nil, fmt.Errorf("下載附件失敗：%w（Content-Length %d，得到 %d）", ErrSizeMismatch, resp.ContentLength, len(data))
 	}
 	return data, nil
 }

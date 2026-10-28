@@ -54,6 +54,7 @@ type traceMoeResponse struct {
 				Native  string `json:"native"`
 				Romaji  string `json:"romaji"`
 				English string `json:"english"`
+				Chinese string `json:"chinese"`
 			} `json:"title"`
 			Synonyms []string `json:"synonyms"`
 		} `json:"anilist"`
@@ -61,7 +62,7 @@ type traceMoeResponse struct {
 	} `json:"result"`
 }
 
-// RecognizeWork 以 POST {BaseURL}/search?anilistInfo&cutBorders 送出圖片，取第一筆結果的作品名稱。
+// RecognizeWork 以 POST {BaseURL}/search?anilistInfo&cutBorders 送出圖片，取第一筆結果的作品名稱（見 workName）。
 // 沒有結果、相似度低於門檻或沒有任何名稱 → ErrNotFound；HTTP 非 2xx（402 額度用完、429、5xx 等）、
 // JSON 的 error 非空或格式錯誤 → 其他錯誤；超過 Timeout → 包含 context.DeadlineExceeded 的錯誤。
 // 圖片應先經 PrepareForTraceMoe 縮小。
@@ -102,18 +103,29 @@ func (t *TraceMoe) RecognizeWork(ctx context.Context, png []byte) (string, error
 		return "", ErrNotFound
 	}
 	a := r.Result[0].Anilist
-	var names []string
-	for _, s := range a.Synonyms {
-		if isChinese(s) {
-			names = append(names, s)
-		}
-	}
-	names = append(names, a.Title.Native, a.Title.English, a.Title.Romaji)
-	name := joinNames(names)
+	name := workName(a.Title.Chinese, a.Title.Native, a.Title.English, a.Title.Romaji, a.Synonyms)
 	if name == "" {
 		return "", ErrNotFound
 	}
 	return name, nil
+}
+
+// workName 組出作品名稱（10/28 使用者決定，取代 Q14）：有中文時只放一個中文名稱——title.chinese 優先，
+// 其次 synonyms 中第一個中文別名；沒有中文時放 native、english（以「、」連接、去重，缺一個只放另一個）；
+// 兩者都沒有才用 romaji。都沒有回 ""。
+func workName(chinese, native, english, romaji string, synonyms []string) string {
+	if c := strings.TrimSpace(chinese); c != "" {
+		return c
+	}
+	for _, s := range synonyms {
+		if isChinese(s) {
+			return strings.TrimSpace(s)
+		}
+	}
+	if name := joinNames([]string{native, english}); name != "" {
+		return name
+	}
+	return strings.TrimSpace(romaji)
 }
 
 // errorBodyMaxRunes 是錯誤訊息中保留的回應本文字數上限。

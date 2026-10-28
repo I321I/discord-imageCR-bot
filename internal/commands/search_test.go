@@ -484,7 +484,8 @@ func TestSearchSubmit_DM(t *testing.T) {
 	}
 }
 
-// 下載失敗、長度不符、超過 25MiB、上傳失敗 → 刪除 deferred 回應、ephemeral 說明原因。
+// 下載失敗、超過 25MiB、上傳失敗 → 刪除 deferred 回應、ephemeral 說明原因。
+// （10/28 Task 1：「長度不符」案例移除，改為 TestSearchSubmit_SizeMismatchStillPosts。）
 // （階段 9 收尾：依使用者決定改為區分原因；完整的四種原因見 TestSearchSubmit_PostFailureReasons。）
 func TestSearchSubmit_PostFailures(t *testing.T) {
 	cases := map[string]struct {
@@ -492,7 +493,6 @@ func TestSearchSubmit_PostFailures(t *testing.T) {
 		want  string
 	}{
 		"下載失敗": {func(e *srEnv, m *discordgo.Message) { e.fetch.err = discordtest.ErrInjected }, msgSearchDownloadFailed},
-		"長度不符": {func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = 999 }, msgSearchDownloadFailed},
 		"超過上限": {func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = pipeline.MaxAttachmentSize + 1 }, msgSearchTooLarge},
 		"上傳失敗": {func(e *srEnv, m *discordgo.Message) {
 			e.fake.FailOn["InteractionResponseEdit"] = discordtest.ErrInjected
@@ -510,6 +510,17 @@ func TestSearchSubmit_PostFailures(t *testing.T) {
 		if _, ok := e.x.Get(index.Key{ChannelID: srChannel, MessageID: m.ID}); !ok {
 			t.Errorf("%s：不應從索引移除", name)
 		}
+	}
+}
+
+// 10/28 Task 1：附件的 Size 與實際下載長度不符仍照常貼出（不再比對 Size）。
+func TestSearchSubmit_SizeMismatchStillPosts(t *testing.T) {
+	e := newSREnv(t)
+	m := e.image(srChannel, imagemsg.Fields{Work: "芙莉蓮"}, "PNG")
+	m.Attachments[0].Size = 999
+	e.s.Submit(context.Background(), searchSubmit(srUser, srChannel+":"+m.ID+":0"))
+	if ed := posted(t, e.fake); len(ed.Files) != 1 || string(ed.Files[0]) != "PNG" {
+		t.Errorf("Size 與實際不符仍應貼出：%+v", ed)
 	}
 }
 

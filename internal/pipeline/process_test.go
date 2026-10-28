@@ -6,7 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"log"
+	"net/http"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -320,20 +324,34 @@ func TestProcess_AttachmentTooLarge(t *testing.T) {
 	}
 }
 
-// 下載到的 bytes 長度與附件 Size 不符（下載不完整）：視為下載失敗，不發、不刪、加 ❌。
+// 下載不完整（10/28 Task 1 起由 Fetcher 以 Content-Length 判斷，回 ErrSizeMismatch）：視為下載失敗，不發、不刪、加 ❌。
 func TestProcess_DownloadSizeMismatch(t *testing.T) {
 	e := newEnv(t)
 	m := e.imageMessage(t, "a.png", "b.png")
 	url := m.Attachments[1].URL
-	e.fetch.data[url] = e.fetch.data[url][:len(e.fetch.data[url])-1]
-	if err := e.p.Process(context.Background(), testGuild, m); err == nil {
-		t.Error("大小不符時 Process 應回錯誤")
+	e.fetch.errs[url] = ErrSizeMismatch
+	if err := e.p.Process(context.Background(), testGuild, m); !errors.Is(err, ErrSizeMismatch) {
+		t.Errorf("下載不完整時 Process 應回 ErrSizeMismatch：%v", err)
 	}
 	if len(e.fake.Sent) != 0 || !e.originalExists(m) {
 		t.Errorf("大小不符時不發不刪：Sent %d", len(e.fake.Sent))
 	}
 	if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) {
 		t.Errorf("原訊息反應應只剩 ❌，得到 %q", got)
+	}
+}
+
+// 10/28 Task 1：附件 Size 與實際下載長度不符（Pi 實測 219770 vs 315747）不再視為失敗，照常處理。
+// （原 TestProcess_DownloadSizeMismatch 以截短資料模擬 Size 不符，依新決定改為上方的 Fetcher 錯誤。）
+func TestProcess_AttachmentSizeDiffersStillProcessed(t *testing.T) {
+	e := newEnv(t)
+	m := e.imageMessage(t, "a.png", "b.png")
+	m.Attachments[1].Size = 219770
+	if err := e.p.Process(context.Background(), testGuild, m); err != nil {
+		t.Fatalf("Size 與實際不符仍應成功：%v", err)
+	}
+	if len(e.fake.Sent) != 2 || e.originalExists(m) {
+		t.Errorf("應發出 2 則並刪除原訊息：Sent %d", len(e.fake.Sent))
 	}
 }
 
@@ -367,6 +385,95 @@ func TestProcess_DeleteFails(t *testing.T) {
 	}
 	if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) {
 		t.Errorf("原訊息反應應只剩 ❌，得到 %q", got)
+	}
+}
+
+// unknownMessage 是 Discord 回的 Unknown Message（404／10008），同 discordtest 的 notFound。
+func unknownMessage() error {
+	return &discordgo.RESTError{
+		Response: &http.Response{StatusCode: http.StatusNotFound, Status: "404 Not Found"},
+		Message:  &discordgo.APIErrorMessage{Code: discordgo.ErrCodeUnknownMessage, Message: "Unknown Message"},
+	}
+}
+
+// 10/28 Task 2：刪除原訊息遇 Unknown Message（10008，原訊息已不在）→ 視為刪除成功：不回錯誤、不加 ❌。
+func TestProcess_OriginalAlreadyDeleted_IsSuccess(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	e := newEnv(t)
+	m := e.imageMessage(t, "a.png")
+	e.fake.FailOn["ChannelMessageDelete"] = unknownMessage()
+	if err := e.p.Process(context.Background(), testGuild, m); err != nil {
+		t.Errorf("原訊息已刪除應視為成功：%v", err)
+	}
+	if len(e.fake.Sent) != 1 || e.index.count() != 1 {
+		t.Errorf("圖片訊息應已發出並進索引：Sent %d、索引 %d", len(e.fake.Sent), e.index.count())
+	}
+	// 成功路徑本來就不移除 ⏳（原訊息已不在）；fake 以 FailOn 模擬時訊息仍在，所以只剩 ⏳、沒有 ❌。
+	if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"⏳"}) {
+		t.Errorf("不應加 ❌，得到 %q", got)
+	}
+	// PM 決定：記一行 log。
+	if want := "原訊息 " + m.ChannelID + "/" + m.ID + " 已不存在（10008），視為已刪除"; !strings.Contains(buf.String(), want) {
+		t.Errorf("log 應含 %q：%s", want, buf.String())
+	}
+}
+
+// 10/28 Task 2：只放寬 10008；其他刪除錯誤（403／50013、404 但非 10008）仍是失敗、加 ❌。
+func TestProcess_DeleteForbiddenStillFails(t *testing.T) {
+	cases := map[string]error{
+		"403 50013": &discordgo.RESTError{
+			Response: &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden"},
+			Message:  &discordgo.APIErrorMessage{Code: discordgo.ErrCodeMissingPermissions, Message: "Missing Permissions"},
+		},
+		"404 10003": &discordgo.RESTError{
+			Response: &http.Response{StatusCode: http.StatusNotFound, Status: "404 Not Found"},
+			Message:  &discordgo.APIErrorMessage{Code: discordgo.ErrCodeUnknownChannel, Message: "Unknown Channel"},
+		},
+	}
+	for name, injected := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			m := e.imageMessage(t, "a.png")
+			e.fake.FailOn["ChannelMessageDelete"] = injected
+			if err := e.p.Process(context.Background(), testGuild, m); err == nil {
+				t.Error("刪除失敗時 Process 應回錯誤")
+			}
+			if got := e.fake.ReactionsOn(testSource, m.ID); !slices.Equal(got, []string{"❌"}) {
+				t.Errorf("原訊息反應應只剩 ❌，得到 %q", got)
+			}
+		})
+	}
+}
+
+// 10/28 Task 2：原訊息在處理中被刪除，移除 ⏳／加 ❌ 遇 10008 只記一行短 log（不含完整錯誤）。
+func TestRun_ReactOnDeletedMessage_NoError(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	e := newEnv(t)
+	m := e.imageMessage(t, "a.png")
+	e.fetch.errs[m.Attachments[0].URL] = discordtest.ErrInjected
+	if err := e.fake.ChannelMessageDelete(m.ChannelID, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.p.Process(context.Background(), testGuild, m); !errors.Is(err, discordtest.ErrInjected) {
+		t.Errorf("應回下載錯誤：%v", err)
+	}
+	for _, c := range e.fake.ReactionCalls {
+		if c.MessageID == m.ID {
+			t.Errorf("不存在的訊息不應有成功的反應：%+v", c)
+		}
+	}
+	out := buf.String()
+	if strings.Contains(out, "Unknown Message") || strings.Contains(out, "10008") {
+		t.Errorf("10008 不應記完整錯誤：%s", out)
+	}
+	for _, want := range []string{"訊息 " + m.ChannelID + "/" + m.ID + " 已不存在，略過加 ❌", "訊息 " + m.ChannelID + "/" + m.ID + " 已不存在，略過移除 ⏳"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log 應含 %q：%s", want, out)
+		}
 	}
 }
 

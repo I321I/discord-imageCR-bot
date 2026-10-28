@@ -4,7 +4,7 @@
 
 ## 專案概況
 
-動畫截圖圖庫 bot：在「圖庫頻道」（來源頻道）自動辨識使用者貼的圖片（圖片附件或圖片網址；trace.moe 查作品、RapidOCR 讀圖片文字），重新發成「圖片＋固定格式文字」的圖片訊息並刪除原訊息；使用者可用 `/search` 在任何地方搜尋並貼出圖片。設計與規劃：`docs/superpowers/specs/2026-10-12-image-bot-design.md`、`docs/plans/2026-10-12-image-bot.md`；圖片網址支援：`docs/plans/2026-10-19-image-url.md`。
+動畫截圖圖庫 bot：在「圖庫頻道」（來源頻道）自動辨識使用者貼的圖片（圖片附件或圖片網址；trace.moe 查作品、RapidOCR 讀圖片文字），重新發成「圖片＋固定格式文字」的圖片訊息並刪除原訊息；使用者可用 `/search` 在任何地方搜尋並貼出圖片。設計與規劃：`docs/superpowers/specs/2026-10-12-image-bot-design.md`、`docs/plans/2026-10-12-image-bot.md`；圖片網址支援：`docs/plans/2026-10-19-image-url.md`；實測修正：`docs/plans/2026-10-28-fixes.md`。
 
 - 語言與依賴：Go 1.27（module `discordbot`）、discordgo v0.29.0、godotenv、`golang.org/x/image`；OCR worker 為 Python 3.12（`ocr/requirements.txt` 全部鎖定版本）。
 - 全部免費：不得引入付費 API。
@@ -54,9 +54,17 @@
 
 - 圖片網址：訊息文字中的 http/https 連結，路徑副檔名為 png/jpg/jpeg/webp/gif，或 Discord 預覽為圖片（type image/gifv，或預覽的 image/thumbnail 就是該網址）；`<網址>`、`||網址||`、`[文字](網址)` 都算，同一網址算一張；附件在前、網址在後一起編號。一般網頁連結不處理；含非圖片附件的訊息整則不處理。搜尋文字一律去掉圖片網址。
 - 新舊區分（`store.IsNewMessage`）：有附件的訊息只看設定時間點；只含圖片網址的看 max(設定時間點, `url_since`)。舊的只收進搜尋。
-- 新訊息：下載網址圖（gifv 不處理），須能解碼成 PNG/JPEG/GIF/WEBP，重新上傳；任一張失敗一張都不發、加 ❌。含尚無預覽的連結時等 5 秒重讀；MESSAGE_UPDATE（預覽補上、編輯加網址）也會觸發。重讀後沒有圖片 → 不發、不刪、不加 ❌（`ErrNoImages`）。
+- 新訊息：下載網址圖（gifv 不處理），須能解碼成 PNG/JPEG/GIF/WEBP，重新上傳；任一張失敗一張都不發、加 ❌。
+- 看圖網頁（2026-10-28）：網址下載結果為 `ErrNotImage`（實際是網頁）時，若 Discord 對該網址有 type image 預覽（`recognize.PreviewImageURL`，不用 gifv），改經同一個 `URLFetcher` 下載預覽的 image（優先）或 thumbnail 網址；該網址就是原網址時改用其 `ProxyURL`（media.discordapp.net）。尚無預覽時等 5 秒重讀一次再找；重讀發現原訊息已刪除 → 同 `ErrNoImages`。檔名沿用原網址。沒有預覽或預覽也失敗 → 照舊加 ❌。其他錯誤（過大、已刪除、連線錯誤）不改抓預覽。`/search` 不受影響。含尚無預覽的連結時等 5 秒重讀；MESSAGE_UPDATE（預覽補上、編輯加網址）也會觸發。重讀後沒有圖片 → 不發、不刪、不加 ❌（`ErrNoImages`）。
 - `URLFetcher` 安全規則（不可放寬）：只 http/https、不帶帳密；只連公開位址的 80、443，在 `net.Dialer.Control` 以實際連線 IP 檢查（含每一跳轉址，最多 5 跳；擋私有／保留／內嵌 IPv4 的 IPv6 過渡位址）；`Proxy: nil`；25MiB、逾時 2 分鐘。測試用 `newURLFetcher(check)` 放行 httptest。
 - `/search` 網址圖：同附件排隊；重讀訊息確認網址仍在原位置，以 `URLFetcher.Check`（15 秒）檢查：確定已刪除（404/410/imgur removed.png）或確定不是圖片 → 回「圖床上的圖片已被刪除」並移除索引；內容確定為四種點陣格式 → 貼出網址（不重新上傳，mention 不通知）；其他（無法確認，`ErrUnconfirmedImage` 等）→ 只有 Discord 對該網址有圖片預覽才貼出，否則回「目前無法確認圖片」（防釣魚）。
+
+### 處理細節（2026-10-28）
+
+- 附件下載：只在 `Size` > 25MiB 時提早拒絕，不再比對下載長度與 `Size`（Discord 回報的 Size 可能與實際不同）；`HTTPFetcher` 改以 HTTP 回應的 Content-Length（≥ 0 時）偵測截斷（`ErrSizeMismatch`），自動解壓或 chunked（-1）不比對。自動處理與 `/search` 共用。
+- 刪除原訊息遇 Unknown Message（code 10008）視為已刪除成功（記一行 log、不加 ❌）；加／移除反應遇 10008 只記一行短 log。只認 10008，其他錯誤（403 等）仍是處理失敗。
+- OCR 改辨識整張的條件另加：字幕區有任何（非空白）文字框 `y.lo ≤ 2`（縮放後字幕區像素，`subtitleTopEdgePx`），表示切到畫面中的文字（如直書漫畫半欄）。
+- 作品名稱（取代舊的多名稱組法）：有中文時只放一個——`title.chinese` 優先，其次 synonyms 中第一個中文別名；沒有中文時放 native、english（「、」連接、去重）；兩者都沒有才用 romaji。不做簡轉繁（`title.chinese` 可能是簡體，用「編輯圖片訊息」修正）。
 
 ### OCR worker
 

@@ -84,7 +84,7 @@ func TestRecognizeAttachment_Priority(t *testing.T) {
 	}
 }
 
-// 下載失敗、超過 25MB、長度不符 → 回錯誤（找不到原圖），不辨識。
+// 下載失敗、超過 25MB → 回錯誤（找不到原圖），不辨識；Size 與實際不符仍辨識（10/28 Task 1）。
 func TestRecognizeAttachment_DownloadErrors(t *testing.T) {
 	e := newEnv(t)
 	m := e.imageMessage(t, "a.png")
@@ -104,13 +104,18 @@ func TestRecognizeAttachment_DownloadErrors(t *testing.T) {
 	if _, err := e.p.RecognizeAttachment(context.Background(), &big, want); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("超過 25MB 應回 ErrTooLarge：%v", err)
 	}
-	wrong := *a
-	wrong.Size = a.Size + 1
-	if _, err := e.p.RecognizeAttachment(context.Background(), &wrong, want); !errors.Is(err, ErrSizeMismatch) {
-		t.Errorf("長度不符應回 ErrSizeMismatch：%v", err)
-	}
 	if called.Load() {
 		t.Error("下載失敗時不應辨識")
+	}
+	// 10/28 Task 1：不再比對 attachment.Size（Pi 實測 Size 219770、實際 315747 被誤殺），
+	// Size 與實際不符仍照常辨識；截斷改由 HTTPFetcher 以 Content-Length 偵測。
+	wrong := *a
+	wrong.Size = a.Size + 1
+	if _, err := e.p.RecognizeAttachment(context.Background(), &wrong, want); err != nil {
+		t.Errorf("Size 與實際不符仍應成功辨識：%v", err)
+	}
+	if !called.Load() {
+		t.Error("Size 與實際不符時應辨識")
 	}
 }
 

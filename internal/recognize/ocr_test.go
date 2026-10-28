@@ -388,7 +388,8 @@ func (s *scriptedItems) RecognizeText(ctx context.Context, img image.Image) (str
 }
 
 func TestRecognizeWithFallback_HorizontalSubtitleKept(t *testing.T) {
-	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 0, 60, 20)}}}
+	// 10/28 Task 4：框改為 y=10（原本 y=0 會碰到上緣而改辨識整張）。
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 10, 60, 20)}}}
 	got, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White))
 	if err != nil || got != "字幕" {
 		t.Fatalf("得到 %q %v", got, err)
@@ -414,12 +415,86 @@ func TestRecognizeWithFallback_VerticalBoxInSubtitleUsesWhole(t *testing.T) {
 
 func TestRecognizeWithFallback_ZeroSizeBoxIsNotVertical(t *testing.T) {
 	point := OCRItem{Box: [4][2]float64{{3, 3}, {3, 3}, {3, 3}, {3, 3}}, Text: "點"}
-	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 0, 60, 20), point}}}
+	// 10/28 Task 4：字幕框改為 y=10（原本 y=0 會碰到上緣）；點在 y=3，未碰到上緣。
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 10, 60, 20), point}}}
 	if _, err := RecognizeWithFallback(context.Background(), s, solid(64, 12, color.White), solid(128, 72, color.White)); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.sizes) != 1 {
 		t.Errorf("零寬高的框不算直書，不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+// 10/28 Task 4：字幕區有文字框碰到上緣（y.lo ≤ subtitleTopEdgePx）→ 字幕區切到畫面中的文字（例如直書漫畫的半欄），改辨識整張。
+func TestRecognizeWithFallback_BoxTouchingTopUsesWhole(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{
+		{rectItem("是", 100, 0, 30, 30)}, // 正方形框（不是直書）碰到上緣
+		{rectItem("整張", 0, 10, 60, 20)},
+	}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White))
+	if err != nil || got != "整張" {
+		t.Fatalf("碰到上緣應改用整張的結果，得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 2 || s.sizes[1] != (image.Point{1280, 874}) {
+		t.Errorf("第二次應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestRecognizeWithFallback_BoxNearTopWithinThreshold(t *testing.T) {
+	if subtitleTopEdgePx != 2 {
+		t.Errorf("門檻 %v，預期 2（Q6）", subtitleTopEdgePx)
+	}
+	s := &scriptedItems{results: [][]OCRItem{
+		{rectItem("字幕", 0, 40, 60, 20), rectItem("是", 100, 2, 30, 30)},
+		{rectItem("整張", 0, 10, 60, 20)},
+	}}
+	if got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White)); err != nil || got != "整張" {
+		t.Fatalf("y.lo = 2 應改用整張，得到 %q %v", got, err)
+	}
+}
+
+func TestRecognizeWithFallback_BoxBelowTopKept(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{{rectItem("字幕", 0, 3, 60, 20)}}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White))
+	if err != nil || got != "字幕" {
+		t.Fatalf("y.lo = 3 應保留字幕區結果，得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 1 {
+		t.Errorf("不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+// 頂端的框是空白文字時不算（同 toBoxes 略過空白）。
+func TestRecognizeWithFallback_BlankBoxAtTopIgnored(t *testing.T) {
+	s := &scriptedItems{results: [][]OCRItem{{rectItem(" ", 0, 0, 60, 20), rectItem("字幕", 0, 40, 60, 20)}}}
+	got, err := RecognizeWithFallback(context.Background(), s, solid(640, 152, color.White), solid(1280, 874, color.White))
+	if err != nil || got != "字幕" {
+		t.Fatalf("空白框不算碰到上緣，得到 %q %v", got, err)
+	}
+	if len(s.sizes) != 1 {
+		t.Errorf("不應辨識整張，得到 %v", s.sizes)
+	}
+}
+
+func TestSubtitleTouchesTop(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []OCRItem
+		want  bool
+	}{
+		{"沒有框", nil, false},
+		{"y.lo = 0", []OCRItem{rectItem("a", 0, 0, 10, 10)}, true},
+		{"y.lo = 2", []OCRItem{rectItem("a", 0, 2, 10, 10)}, true},
+		{"y.lo = 2.5", []OCRItem{rectItem("a", 0, 2.5, 10, 10)}, false},
+		{"y.lo = 3", []OCRItem{rectItem("a", 0, 3, 10, 10)}, false},
+		{"負座標", []OCRItem{rectItem("a", 0, -1, 10, 10)}, true},
+		{"空白文字", []OCRItem{rectItem("  ", 0, 0, 10, 10)}, false},
+		{"任一框碰到", []OCRItem{rectItem("a", 0, 30, 10, 10), rectItem("b", 20, 1, 10, 10)}, true},
+	}
+	for _, c := range cases {
+		if got := subtitleTouchesTop(c.items); got != c.want {
+			t.Errorf("%s：subtitleTouchesTop = %v，預期 %v", c.name, got, c.want)
+		}
 	}
 }
 

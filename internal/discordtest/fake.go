@@ -359,6 +359,9 @@ func (f *Fake) MessageReactionAdd(channelID, messageID, emojiID string, options 
 	if err := f.begin("MessageReactionAdd"); err != nil {
 		return err
 	}
+	if _, m := f.find(channelID, messageID); m == nil {
+		return notFound("Message")
+	}
 	f.ReactionCalls = append(f.ReactionCalls, ReactionCall{Op: "add", ChannelID: channelID, MessageID: messageID, Emoji: emojiID})
 	return nil
 }
@@ -368,6 +371,9 @@ func (f *Fake) MessageReactionRemove(channelID, messageID, emojiID, userID strin
 	defer f.mu.Unlock()
 	if err := f.begin("MessageReactionRemove"); err != nil {
 		return err
+	}
+	if _, m := f.find(channelID, messageID); m == nil {
+		return notFound("Message")
 	}
 	f.ReactionCalls = append(f.ReactionCalls, ReactionCall{Op: "remove", ChannelID: channelID, MessageID: messageID, Emoji: emojiID, UserID: userID})
 	return nil

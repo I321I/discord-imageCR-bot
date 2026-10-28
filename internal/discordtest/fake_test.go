@@ -118,6 +118,8 @@ func idsOf(ms []*discordgo.Message) []string {
 
 func TestFake_Reactions(t *testing.T) {
 	f := NewFake()
+	// 10/28 Task 2：訊息不存在時反應回 10008，所以先建立訊息。
+	f.AddMessage(&discordgo.Message{ID: "m1", ChannelID: "c1"})
 	if err := f.MessageReactionAdd("c1", "m1", "⏳"); err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +141,23 @@ func TestFake_Reactions(t *testing.T) {
 	}
 	if got := f.ReactionsOn("c1", "m1"); len(got) != 1 {
 		t.Errorf("失敗的新增不應改變反應，得到 %q", got)
+	}
+}
+
+// 10/28 Task 2：對不存在的訊息加／移除反應回 Unknown Message（10008），不記入 ReactionCalls。
+func TestFake_ReactionsOnUnknownMessage(t *testing.T) {
+	f := NewFake()
+	for name, err := range map[string]error{
+		"add":    f.MessageReactionAdd("c1", "gone", "❌"),
+		"remove": f.MessageReactionRemove("c1", "gone", "⏳", "@me"),
+	} {
+		var rest *discordgo.RESTError
+		if !errors.As(err, &rest) || rest.Message == nil || rest.Message.Code != discordgo.ErrCodeUnknownMessage {
+			t.Errorf("%s：應回 10008，得到 %v", name, err)
+		}
+	}
+	if len(f.ReactionCalls) != 0 {
+		t.Errorf("失敗的反應不應記錄：%+v", f.ReactionCalls)
 	}
 }
 

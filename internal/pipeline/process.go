@@ -143,7 +143,7 @@ func (p *Pipeline) HandleMessageUpdate(ctx context.Context, m *discordgo.Message
 }
 
 // Process 把一則來源頻道的圖片訊息排入佇列（見 Enqueue）並等待處理完成：
-// 下載全部圖片（附件：超過 25MB 不下載、長度與 Size 不符視為下載失敗；網址圖：經 URLFetch 下載，
+// 下載全部圖片（附件：超過 25MB 不下載、長度與 Content-Length 不符視為下載失敗；網址圖：經 URLFetch 下載，
 // 必須能解碼成 PNG／JPEG／GIF／WEBP，U5）→ 逐張辨識（全部完成）→
 // 每張發一則圖片訊息（重新上傳，mention 一律不通知，原訊息去掉圖片網址後的文字放進關鍵字）→
 // 每則成功就加入索引 → 全部發完才刪除原訊息。
@@ -166,8 +166,9 @@ func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Mes
 		return ErrNoImages
 	}
 	files := make([]sourceFile, len(srcs))
+	pv := &previews{m: m, embeds: m.Embeds}
 	for i, src := range srcs {
-		f, err := p.downloadSource(ctx, src)
+		f, err := p.downloadSource(ctx, src, pv)
 		if err != nil {
 			return err
 		}
@@ -204,18 +205,22 @@ func (p *Pipeline) process(ctx context.Context, guildID string, m *discordgo.Mes
 		return errors.Join(sendErrs...)
 	}
 	if err := p.API.ChannelMessageDelete(m.ChannelID, m.ID); err != nil {
-		return fmt.Errorf("刪除原訊息失敗：%w", err)
+		if !isUnknownMessage(err) {
+			return fmt.Errorf("刪除原訊息失敗：%w", err)
+		}
+		// Unknown Message（10008）：原訊息已不在，視為刪除成功（10/28）。
+		log.Printf("原訊息 %s/%s 已不存在（10008），視為已刪除", m.ChannelID, m.ID)
 	}
 	return nil
 }
 
 // downloadSource 下載一張圖：附件見 download；網址圖見 downloadLink。
-func (p *Pipeline) downloadSource(ctx context.Context, src recognize.ImageSource) (sourceFile, error) {
+func (p *Pipeline) downloadSource(ctx context.Context, src recognize.ImageSource, pv *previews) (sourceFile, error) {
 	if !src.IsLink() {
 		data, err := p.download(ctx, src.Attachment)
 		return sourceFile{name: src.Attachment.Filename, contentType: src.Attachment.ContentType, data: data}, err
 	}
-	return p.downloadLink(ctx, src)
+	return p.downloadLink(ctx, src, pv)
 }
 
 // linkFormats 是網址圖支援的格式（image.DecodeConfig 的格式名稱）與對應副檔名（第一個為預設）。
@@ -226,24 +231,84 @@ var linkFormats = map[string][]string{
 	"webp": {".webp"},
 }
 
+// previews 是處理中訊息的預覽（看圖網頁改抓預覽圖用）；一則訊息最多等待重讀一次。
+type previews struct {
+	m         *discordgo.Message
+	embeds    []*discordgo.MessageEmbed
+	refreshed bool
+}
+
 // downloadLink 下載網址圖（src.FetchURL），確認能解碼成 PNG／JPEG／GIF／WEBP（否則 ErrNotImage，U5），
 // 決定上傳的檔名與類型。
-func (p *Pipeline) downloadLink(ctx context.Context, src recognize.ImageSource) (sourceFile, error) {
+// 看圖網頁（10/28）：結果為 ErrNotImage 且 Discord 對該網址有 type image 預覽（recognize.PreviewImageURL）時，
+// 改以同一個 URLFetch 下載預覽的圖片並做同樣的檢查，檔名沿用原網址（Q5）。尚無預覽時等 EmbedWait 重讀訊息
+// 再找一次（Q1 A，每則訊息最多一次）：期間 ctx 結束回 ctx 錯誤；原訊息已刪除回 ErrNoImages（不發、不刪、不加 ❌）。
+// 其他錯誤（ErrTooLarge、ErrImageGone、連線錯誤）不改抓預覽。
+func (p *Pipeline) downloadLink(ctx context.Context, src recognize.ImageSource, pv *previews) (sourceFile, error) {
 	if p.URLFetch == nil {
 		return sourceFile{}, fmt.Errorf("下載網址 %s 失敗：沒有網址下載器", src.URL)
 	}
-	data, err := p.URLFetch.Fetch(ctx, src.FetchURL)
+	data, format, err := p.fetchLinkImage(ctx, src.URL, src.FetchURL)
+	if errors.Is(err, ErrNotImage) {
+		prev := recognize.PreviewImageURL(src.URL, pv.embeds)
+		if prev == "" && !pv.refreshed {
+			pv.refreshed = true
+			if werr := p.refetchPreviews(ctx, pv); werr != nil {
+				return sourceFile{}, werr
+			}
+			prev = recognize.PreviewImageURL(src.URL, pv.embeds)
+		}
+		if prev != "" {
+			var perr error
+			if data, format, perr = p.fetchLinkImage(ctx, prev, prev); perr != nil {
+				return sourceFile{}, fmt.Errorf("%w；改抓預覽 %s 也失敗：%w", err, prev, perr)
+			}
+			err = nil
+		}
+	}
 	if err != nil {
-		return sourceFile{}, fmt.Errorf("下載網址 %s 失敗：%w", src.URL, err)
+		return sourceFile{}, err
+	}
+	return sourceFile{name: linkFilename(src, format), contentType: "image/" + format, data: data}, nil
+}
+
+// fetchLinkImage 以 URLFetch 下載 fetchURL，回傳內容與格式；不能解碼成支援的格式時回 ErrNotImage。
+// display 是錯誤訊息中顯示的網址。
+func (p *Pipeline) fetchLinkImage(ctx context.Context, display, fetchURL string) ([]byte, string, error) {
+	data, err := p.URLFetch.Fetch(ctx, fetchURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("下載網址 %s 失敗：%w", display, err)
 	}
 	_, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
-		return sourceFile{}, fmt.Errorf("網址 %s：%w（%v）", src.URL, ErrNotImage, err)
+		return nil, "", fmt.Errorf("網址 %s：%w（%v）", display, ErrNotImage, err)
 	}
 	if linkFormats[format] == nil {
-		return sourceFile{}, fmt.Errorf("網址 %s：%w（格式 %s）", src.URL, ErrNotImage, format)
+		return nil, "", fmt.Errorf("網址 %s：%w（格式 %s）", display, ErrNotImage, format)
 	}
-	return sourceFile{name: linkFilename(src, format), contentType: "image/" + format, data: data}, nil
+	return data, format, nil
+}
+
+// refetchPreviews 等 EmbedWait 後重讀訊息、更新 pv.embeds（預覽是非同步產生的）。
+// ctx 先結束回 ctx 錯誤；原訊息已刪除回 ErrNoImages；其他重讀錯誤只記 log，沿用原本的預覽。
+func (p *Pipeline) refetchPreviews(ctx context.Context, pv *previews) error {
+	t := time.NewTimer(p.embedWait())
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+	}
+	fresh, err := p.API.ChannelMessage(pv.m.ChannelID, pv.m.ID)
+	if err != nil {
+		if isNotFound(err) {
+			return fmt.Errorf("等待預覽期間原訊息已刪除：%w", ErrNoImages)
+		}
+		log.Printf("重讀訊息 %s/%s 失敗：%v", pv.m.ChannelID, pv.m.ID, err)
+		return nil
+	}
+	pv.embeds = fresh.Embeds
+	return nil
 }
 
 // maxLinkStem 是網址圖檔名主檔名的長度上限。
@@ -279,7 +344,8 @@ func linkFilename(src recognize.ImageSource, format string) string {
 	return name
 }
 
-// download 下載附件：超過 25MB 不下載；長度與 Size 不符視為下載失敗。
+// download 下載附件：Size 超過 25MB 不下載；下載不完整由 Fetcher 判斷（HTTPFetcher 比對 Content-Length，
+// 不與 Size 比對——Discord 回報的 Size 可能與實際不同）。
 func (p *Pipeline) download(ctx context.Context, a *discordgo.MessageAttachment) ([]byte, error) {
 	if a.Size > MaxAttachmentSize {
 		return nil, fmt.Errorf("附件 %s：%w（%d bytes）", a.Filename, ErrTooLarge, a.Size)
@@ -288,22 +354,33 @@ func (p *Pipeline) download(ctx context.Context, a *discordgo.MessageAttachment)
 	if err != nil {
 		return nil, fmt.Errorf("下載附件 %s 失敗：%w", a.Filename, err)
 	}
-	if len(data) != a.Size {
-		return nil, fmt.Errorf("下載附件 %s 失敗：%w（預期 %d bytes，得到 %d）", a.Filename, ErrSizeMismatch, a.Size, len(data))
-	}
 	return data, nil
 }
 
-// react 在原訊息加上 bot 的反應；失敗只記 log。
+// react 在原訊息加上 bot 的反應；失敗只記 log（原訊息已不在（10008）只記一行短 log）。
 func (p *Pipeline) react(m *discordgo.Message, emoji string) {
 	if err := p.API.MessageReactionAdd(m.ChannelID, m.ID, emoji); err != nil {
+		if isUnknownMessage(err) {
+			log.Printf("訊息 %s/%s 已不存在，略過加 %s", m.ChannelID, m.ID, emoji)
+			return
+		}
 		log.Printf("在訊息 %s/%s 加 %s 失敗：%v", m.ChannelID, m.ID, emoji, err)
 	}
 }
 
-// unreact 移除 bot 在原訊息上的反應；失敗只記 log。
+// unreact 移除 bot 在原訊息上的反應；失敗只記 log（原訊息已不在（10008）只記一行短 log）。
 func (p *Pipeline) unreact(m *discordgo.Message, emoji string) {
 	if err := p.API.MessageReactionRemove(m.ChannelID, m.ID, emoji, "@me"); err != nil {
+		if isUnknownMessage(err) {
+			log.Printf("訊息 %s/%s 已不存在，略過移除 %s", m.ChannelID, m.ID, emoji)
+			return
+		}
 		log.Printf("移除訊息 %s/%s 的 %s 失敗：%v", m.ChannelID, m.ID, emoji, err)
 	}
+}
+
+// isUnknownMessage 回傳 err 是否為 Discord 的 Unknown Message（code 10008）。
+func isUnknownMessage(err error) bool {
+	var rest *discordgo.RESTError
+	return errors.As(err, &rest) && rest.Message != nil && rest.Message.Code == discordgo.ErrCodeUnknownMessage
 }
