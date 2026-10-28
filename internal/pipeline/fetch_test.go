@@ -1,10 +1,14 @@
 package pipeline
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,5 +74,70 @@ func TestNewHTTPFetcher_Defaults(t *testing.T) {
 	}
 	if f.Client == nil || f.Client.Timeout != 2*time.Minute {
 		t.Errorf("Client 逾時應為 2 分鐘：%+v", f.Client)
+	}
+}
+
+// 10/28 Task 1：以 HTTP Content-Length 偵測截斷——宣告 100 bytes 只收到 50 → 錯誤。
+func TestHTTPFetcher_ShortBodyIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.Write([]byte(strings.Repeat("x", 50)))
+	}))
+	defer srv.Close()
+	_, err := NewHTTPFetcher().Fetch(context.Background(), srv.URL)
+	if err == nil || !(errors.Is(err, ErrSizeMismatch) || errors.Is(err, io.ErrUnexpectedEOF)) {
+		t.Errorf("內容短於 Content-Length 應回錯誤，得到 %v", err)
+	}
+}
+
+// 10/28 Task 1：沒有 Content-Length（chunked）時不比對長度，照常成功。
+func TestHTTPFetcher_NoContentLengthOK(t *testing.T) {
+	const n = 315747
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := []byte(strings.Repeat("x", 1000))
+		for left := n; left > 0; left -= len(chunk) {
+			if left < len(chunk) {
+				chunk = chunk[:left]
+			}
+			w.Write(chunk)
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+	got, err := NewHTTPFetcher().Fetch(context.Background(), srv.URL)
+	if err != nil || len(got) != n {
+		t.Errorf("chunked 應成功、%d bytes，得到 %d bytes %v", n, len(got), err)
+	}
+}
+
+// 10/28 Task 1：伺服器回 gzip、Transport 自動解壓（ContentLength 變 -1）時不可誤判截斷。
+func TestHTTPFetcher_GzipAutoDecompressOK(t *testing.T) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write([]byte(strings.Repeat("y", 5000)))
+	zw.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+		w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+	got, err := NewHTTPFetcher().Fetch(context.Background(), srv.URL)
+	if err != nil || len(got) != 5000 {
+		t.Errorf("gzip 自動解壓應成功、5000 bytes，得到 %d bytes %v", len(got), err)
+	}
+}
+
+// 超過上限時回 ErrTooLarge 而不是 ErrSizeMismatch（Content-Length 與截到上限的長度必然不符）。
+func TestHTTPFetcher_TooLargeWithContentLength(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "20")
+		w.Write([]byte(strings.Repeat("x", 20)))
+	}))
+	defer srv.Close()
+	f := NewHTTPFetcher()
+	f.MaxBytes = 10
+	if _, err := f.Fetch(context.Background(), srv.URL); !errors.Is(err, ErrTooLarge) || errors.Is(err, ErrSizeMismatch) {
+		t.Errorf("超過上限應回 ErrTooLarge，得到 %v", err)
 	}
 }

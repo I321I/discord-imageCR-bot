@@ -481,7 +481,7 @@ func (s *Search) failAfterDefer(i *discordgo.InteractionCreate, msg string) {
 	}
 }
 
-// download 下載附件：超過 25MiB 不下載；長度與 Size 不符視為下載失敗（同自動處理）。
+// download 下載附件：Size 超過 25MiB 不下載；下載不完整由 Fetcher 判斷（同自動處理，不與 Size 比對）。
 func download(ctx context.Context, f pipeline.Fetcher, a *discordgo.MessageAttachment) ([]byte, error) {
 	if a.Size > pipeline.MaxAttachmentSize {
 		return nil, fmt.Errorf("附件 %s：%w（%d bytes）", a.Filename, pipeline.ErrTooLarge, a.Size)
@@ -489,9 +489,6 @@ func download(ctx context.Context, f pipeline.Fetcher, a *discordgo.MessageAttac
 	data, err := f.Fetch(ctx, a.URL)
 	if err != nil {
 		return nil, err
-	}
-	if len(data) != a.Size {
-		return nil, fmt.Errorf("下載附件 %s 失敗：%w（預期 %d bytes，得到 %d）", a.Filename, pipeline.ErrSizeMismatch, a.Size, len(data))
 	}
 	return data, nil
 }

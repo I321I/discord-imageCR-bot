@@ -68,8 +68,9 @@ func TestTraceMoe_Success(t *testing.T) {
 	if gotKey != "" {
 		t.Errorf("Key 為空時不應帶 x-trace-key，得到 %q", gotKey)
 	}
-	// Q14：含中文的別名放最前（依原順序），再接 native、english、romaji；去重，以「、」連接。
-	want := "葬送的芙莉蓮、葬送的芙莉莲、葬送のフリーレン、Frieren: Beyond Journey's End、Sousou no Frieren"
+	// 10/28 Task 5（使用者決定，取代 Q14 的組名方式）：有中文只放一個中文名稱——title.chinese 優先，
+	// 其次 synonyms 中第一個中文別名。原預期為「葬送的芙莉蓮、葬送的芙莉莲、葬送のフリーレン、Frieren: Beyond Journey's End、Sousou no Frieren」。
+	want := "葬送的芙莉蓮"
 	if name != want {
 		t.Errorf("作品名稱\n得到 %q\n預期 %q", name, want)
 	}
@@ -96,8 +97,9 @@ func TestTraceMoe_NamesDedupAndMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "銀魂、Gintama" {
-		t.Errorf("應去重，得到 %q", name)
+	// 10/28 Task 5：synonyms 有中文「銀魂」→ 只放它（原預期「銀魂、Gintama」）。
+	if name != "銀魂" {
+		t.Errorf("有中文只放一個中文名稱，得到 %q", name)
 	}
 
 	tm = newTraceMoeServer(t, respondJSON(`{"error":"","result":[{"anilist":{"title":{"native":null,"romaji":"Only Romaji","english":null},"synonyms":null},"similarity":0.99}]}`))
@@ -216,7 +218,8 @@ func TestTraceMoe_NamesNotSplitOnCommas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "中二病也想談戀愛，第一季、中二病でも恋がしたい!、Love, Chunibyo & Other Delusions!、Chuunibyou demo Koi ga Shitai!"
+	// 10/28 Task 5：只放中文名稱（原預期另接 native、english、romaji）。
+	want := "中二病也想談戀愛，第一季"
 	if name != want {
 		t.Errorf("得到 %q\n預期 %q", name, want)
 	}
@@ -268,5 +271,50 @@ func TestTraceMoe_HTTPErrorBodyTruncated(t *testing.T) {
 	})
 	if _, err := short.RecognizeWork(context.Background(), []byte("x")); err == nil || !strings.Contains(err.Error(), "Search quota depleted") {
 		t.Errorf("短本文應完整保留，得到 %v", err)
+	}
+}
+
+// 10/28 Task 5：title.chinese 優先於 synonyms 的中文別名，且只放這一個名稱。
+func TestTraceMoe_ChineseTitleFirst(t *testing.T) {
+	tm := newTraceMoeServer(t, respondJSON(`{"error":"","result":[{"anilist":{"title":{"native":"FX戦士くるみちゃん","romaji":"FX Senshi Kurumi-chan","chinese":"FX 戰士久留美","english":"FX Fighter Kurumi-chan"},"synonyms":["Kurumi si Pejuang Forex","外匯戰士久留美"]},"similarity":0.99}]}`))
+	name, err := tm.RecognizeWork(context.Background(), []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "FX 戰士久留美" {
+		t.Errorf("得到 %q，預期只有 title.chinese", name)
+	}
+}
+
+// 10/28 Task 5：title.chinese 為空白時改用 synonyms 中第一個中文別名。
+func TestTraceMoe_BlankChineseUsesSynonym(t *testing.T) {
+	tm := newTraceMoeServer(t, respondJSON(`{"error":"","result":[{"anilist":{"title":{"native":"生徒会にも穴はある！","chinese":" ","english":"A"},"synonyms":["Seitokai","學生會也有洞！","学生会也有洞！"]},"similarity":0.99}]}`))
+	name, err := tm.RecognizeWork(context.Background(), []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "學生會也有洞！" {
+		t.Errorf("得到 %q，預期 synonyms 第一個中文別名", name)
+	}
+}
+
+// 10/28 Task 5：沒有中文 → native、english（去重；缺一個只放另一個），不放 romaji。
+func TestTraceMoe_NoChineseUsesNativeAndEnglish(t *testing.T) {
+	cases := []struct{ body, want string }{
+		{`{"native":"FX戦士くるみちゃん","romaji":"FX Senshi Kurumi-chan","english":"FX Fighter Kurumi-chan"},"synonyms":["Kurumi si Pejuang Forex","くるみちゃん"]`, "FX戦士くるみちゃん、FX Fighter Kurumi-chan"},
+		{`{"native":"ぼっち・ざ・ろっく！","romaji":"Bocchi the Rock!","english":null},"synonyms":[]`, "ぼっち・ざ・ろっく！"},
+		{`{"native":null,"romaji":"Bocchi the Rock!","english":"BOCCHI THE ROCK!"}`, "BOCCHI THE ROCK!"},
+		{`{"native":"Same","romaji":"R","english":"Same"}`, "Same"},
+		{`{"native":"","romaji":"Only Romaji","english":"","chinese":""}`, "Only Romaji"},
+	}
+	for _, c := range cases {
+		tm := newTraceMoeServer(t, respondJSON(`{"error":"","result":[{"anilist":{"title":`+c.body+`},"similarity":0.99}]}`))
+		name, err := tm.RecognizeWork(context.Background(), []byte("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name != c.want {
+			t.Errorf("%s：得到 %q，預期 %q", c.body, name, c.want)
+		}
 	}
 }

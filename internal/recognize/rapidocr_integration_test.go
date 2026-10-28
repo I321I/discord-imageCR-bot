@@ -68,6 +68,10 @@ func TestRapidOCR_RealImages(t *testing.T) {
 		{"manga_vertical_ramen.webp", "日式拉麵這種亂敲人竹槓的不入流料理能收掉一間就是台灣吃的文化之福什麼", false}, // 漫畫直書（中文）
 		{"manga_4koma_japanese.webp", "前から好きだった螺子さんに告白した初めての夜僕らはひとつになっただがそんな僕らの関係も長くは続かなかった", false}, // 四格漫畫（日文）
 		{"manga_page_dense.webp", "我應該教過你不可或缺的三感了吧難道你忘光了嗎所謂的如果女主沒有去追求身體的快樂就完全不及格", false},            // 文字密集的漫畫頁
+		// 10/28：直書漫畫的文字欄在下緣被字幕區切到半欄（Task 4：碰到上緣改辨識整張）。
+		{"manga_vertical_bottom_edge.webp", "腦子是不是有病啊", false},
+		{"sub_pasted_cropped.png", "回家吃飯來一發再睡覺", true}, // 10/28：貼上的裁切字幕截圖，不可因碰到上緣改走整張
+		{"sub_fx_kurumi.webp", "那種感覺很爽吧", true},        // 10/28（Q7）
 	} {
 		t.Run(c.file, func(t *testing.T) {
 			data, err := os.ReadFile("testdata/" + c.file)
@@ -101,5 +105,44 @@ func TestRapidOCR_RealBlankImageIsNoText(t *testing.T) {
 	r := integrationOCR(t)
 	if _, err := RecognizeWithFallback(context.Background(), r, PrepareForOCR(img), PrepareWholeForOCR(img)); !errors.Is(err, ErrNoText) {
 		t.Errorf("空白圖應回 ErrNoText，得到 %v", err)
+	}
+}
+
+// 10/28 Task 4：記錄字幕區每個文字框的 y 範圍（縮放後字幕區像素），檢查「碰到上緣」門檻（subtitleTopEdgePx）。
+// manga_vertical_bottom_edge.webp 應碰到上緣、sub_pasted_cropped.png 不應；其餘只記錄（缺圖略過）。
+func TestRapidOCR_SubtitleTopEdge(t *testing.T) {
+	r := integrationOCR(t)
+	want := map[string]bool{"manga_vertical_bottom_edge.webp": true, "sub_pasted_cropped.png": false}
+	for _, file := range []string{
+		"manga_vertical_bottom_edge.webp", "sub_pasted_cropped.png", "sub_fx_kurumi.webp",
+		"sub_two_lines_right.png", "sub_phone_letterbox.webp", "sub_one_line.webp", "sub_japanese.webp", "tv_show.webp",
+	} {
+		t.Run(file, func(t *testing.T) {
+			data, err := os.ReadFile("testdata/" + file)
+			if errors.Is(err, fs.ErrNotExist) {
+				t.Skipf("找不到測試圖片 %s，略過", file)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			img, err := DecodeFirstFrame(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sub := PrepareForOCR(img)
+			items, err := r.RecognizeItems(context.Background(), sub)
+			if err != nil && !errors.Is(err, ErrNoText) {
+				t.Fatal(err)
+			}
+			t.Logf("字幕區 %v", sub.Bounds().Size())
+			for _, b := range toBoxes(items) {
+				t.Logf("y %.1f–%.1f x %.1f–%.1f %q", b.y.lo, b.y.hi, b.x.lo, b.x.hi, b.text)
+			}
+			got := subtitleTouchesTop(items)
+			t.Logf("subtitleTouchesTop = %v", got)
+			if w, ok := want[file]; ok && got != w {
+				t.Errorf("subtitleTouchesTop = %v，預期 %v", got, w)
+			}
+		})
 	}
 }

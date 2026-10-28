@@ -288,6 +288,35 @@ func HasImagePreview(raw string, embeds []*discordgo.MessageEmbed) bool {
 	return false
 }
 
+// PreviewImageURL 回傳 Discord 對 raw 的 type image 預覽（URL、image 或 thumbnail 與 raw 相同，皆以 sameURL 比對）
+// 中的圖片網址：image 有值時用 image，否則 thumbnail；該網址與 raw 相同（重抓同一網頁沒有意義）時改用對應的
+// ProxyURL（Discord 的 media.discordapp.net 代理，PM 決定）。ProxyURL 也沒有或也與 raw 相同時找後面符合的預覽，
+// 都沒有回 ""。gifv 不算（動圖網頁或影片，Q4）。用於看圖網頁網址改抓預覽圖（10/28）。
+func PreviewImageURL(raw string, embeds []*discordgo.MessageEmbed) string {
+	for _, e := range embeds {
+		if e == nil || e.Type != discordgo.EmbedTypeImage {
+			continue
+		}
+		if !sameURL(e.URL, raw) && (e.Image == nil || !sameURL(e.Image.URL, raw)) && (e.Thumbnail == nil || !sameURL(e.Thumbnail.URL, raw)) {
+			continue
+		}
+		var cand, proxy string
+		switch {
+		case e.Image != nil && e.Image.URL != "":
+			cand, proxy = e.Image.URL, e.Image.ProxyURL
+		case e.Thumbnail != nil && e.Thumbnail.URL != "":
+			cand, proxy = e.Thumbnail.URL, e.Thumbnail.ProxyURL
+		}
+		if cand != "" && sameURL(cand, raw) {
+			cand = proxy
+		}
+		if cand != "" && !sameURL(cand, raw) {
+			return cand
+		}
+	}
+	return ""
+}
+
 // embedFor 回傳是否有任何預覽屬於 raw（URL、image 或 thumbnail 相同）。
 func embedFor(raw string, embeds []*discordgo.MessageEmbed) bool {
 	for _, e := range embeds {

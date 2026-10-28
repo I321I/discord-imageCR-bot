@@ -22,7 +22,9 @@ func TestGate4_TraceMoe_RealisticResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "請問您今天要來點兔子嗎？？、ご注文はうさぎですか？？、Is the Order a Rabbit??、Gochuumon wa Usagi desu ka??"
+	// 10/28 Task 5（使用者決定，取代 Q14）：有中文只放一個中文名稱。
+	// 原預期為「請問您今天要來點兔子嗎？？、ご注文はうさぎですか？？、Is the Order a Rabbit??、Gochuumon wa Usagi desu ka??」。
+	want := "請問您今天要來點兔子嗎？？"
 	if name != want {
 		t.Errorf("得到 %q\n預期 %q", name, want)
 	}

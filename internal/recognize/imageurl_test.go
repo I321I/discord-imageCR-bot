@@ -329,3 +329,49 @@ func TestHasImagePreview(t *testing.T) {
 		}
 	}
 }
+
+// 10/28 Task 3：看圖網頁（副檔名像圖片、實際是網頁）改下載 Discord 預覽的圖片網址。
+// 只認 type image（Q4：不用 gifv）；候選與原網址相同時改用 ProxyURL（PM 決定），否則找後面的預覽。
+func TestPreviewImageURL(t *testing.T) {
+	const u = "https://img.verb.tw/view/x.jpg"
+	const img = "https://img.verb.tw/i/x.jpg"
+	const thumb = "https://img.verb.tw/t/x.jpg"
+	const proxy = "https://media.discordapp.net/external/abc/https/img.verb.tw/view/x.jpg"
+	cases := []struct {
+		name   string
+		embeds []*discordgo.MessageEmbed
+		want   string
+	}{
+		{"沒有預覽", nil, ""},
+		{"image、URL 相同、Image 為另一網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: img}, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: thumb}}}, img},
+		{"只有 Thumbnail", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: thumb}}}, thumb},
+		{"Image.URL 為空時用 Thumbnail", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{}, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: thumb}}}, thumb},
+		{"Image.URL 等於原網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: u}}}, ""},
+		{"Thumbnail 等於原網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u}}}, ""},
+		{"沒有 Image 與 Thumbnail", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u}}, ""},
+		{"article", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeArticle, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: thumb}}}, ""},
+		{"link", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeLink, URL: u, Image: &discordgo.MessageEmbedImage{URL: img}}}, ""},
+		{"rich", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeRich, URL: u, Image: &discordgo.MessageEmbedImage{URL: img}}}, ""},
+		{"gifv（Q4 不用）", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeGifv, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: thumb}}}, ""},
+		{"屬於別的網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: "https://img.verb.tw/view/y.jpg", Image: &discordgo.MessageEmbedImage{URL: img}}}, ""},
+		// PM 決定（10/28 實作後）：候選與原網址相同時改用對應的 ProxyURL；也沒有或也相同就找後面符合的預覽。
+		{"Image.URL 等於原網址、改用 Image.ProxyURL", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: u, ProxyURL: proxy}}}, proxy},
+		{"Thumbnail 等於原網址、改用 Thumbnail.ProxyURL", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u, ProxyURL: proxy}}}, proxy},
+		{"ProxyURL 也等於原網址", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u, ProxyURL: u}}}, ""},
+		{"第一個沒有可用候選、繼續找後面的", []*discordgo.MessageEmbed{
+			{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u}},
+			{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: img}},
+		}, img},
+		{"第一個 ProxyURL 相同、後面的用 ProxyURL", []*discordgo.MessageEmbed{
+			{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: u, ProxyURL: u}},
+			{Type: discordgo.EmbedTypeImage, URL: u, Thumbnail: &discordgo.MessageEmbedThumbnail{URL: u, ProxyURL: proxy}},
+		}, proxy},
+		{"ProxyURL 只在候選與原網址相同時使用", []*discordgo.MessageEmbed{{Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: img, ProxyURL: proxy}}}, img},
+		{"略過 nil 與不相符的預覽", []*discordgo.MessageEmbed{nil, {Type: discordgo.EmbedTypeArticle, URL: u}, {Type: discordgo.EmbedTypeImage, URL: u, Image: &discordgo.MessageEmbedImage{URL: img}}}, img},
+	}
+	for _, c := range cases {
+		if got := PreviewImageURL(u, c.embeds); got != c.want {
+			t.Errorf("%s：PreviewImageURL = %q，預期 %q", c.name, got, c.want)
+		}
+	}
+}

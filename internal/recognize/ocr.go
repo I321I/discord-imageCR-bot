@@ -75,7 +75,8 @@ type fallbackRecognizer interface {
 // 以下情況改辨識整張，並以整張的結果為準：
 //   - 圖片高 > 寬（whole 與原圖同比例）：直接辨識整張，不先讀字幕區；
 //   - 字幕區沒讀到字（ErrNoText，Q57 (b)）；
-//   - 字幕區讀到直書框（高/寬 ≥ 1.5；t 能回傳文字框時才判斷）。
+//   - 字幕區讀到直書框（高/寬 ≥ 1.5；t 能回傳文字框時才判斷）；
+//   - 字幕區有文字框碰到上緣（y.lo ≤ subtitleTopEdgePx，10/28；t 能回傳文字框時才判斷）。
 //
 // 字幕區的其他錯誤直接回傳、不重試。t 為 SerializeText 的包裝時，整個流程只排隊一次（整張重試接續處理）。
 func RecognizeWithFallback(ctx context.Context, t TextRecognizer, subtitle, whole image.Image) (string, error) {
@@ -95,7 +96,7 @@ func RecognizeWithFallback(ctx context.Context, t TextRecognizer, subtitle, whol
 	return t.RecognizeText(ctx, whole)
 }
 
-// recognizeSubtitle 辨識字幕區；useWhole 為 true 表示要改辨識整張（沒讀到字或讀到直書框）。
+// recognizeSubtitle 辨識字幕區；useWhole 為 true 表示要改辨識整張（沒讀到字、讀到直書框或有框碰到上緣）。
 func recognizeSubtitle(ctx context.Context, t TextRecognizer, subtitle image.Image) (text string, useWhole bool, err error) {
 	ir, ok := t.(itemRecognizer)
 	if !ok {
@@ -111,8 +112,25 @@ func recognizeSubtitle(ctx context.Context, t TextRecognizer, subtitle image.Ima
 			return "", true, nil
 		}
 	}
+	if subtitleTouchesTop(items) {
+		return "", true, nil
+	}
 	text = JoinOCRItems(items)
 	return text, text == "", nil
+}
+
+// subtitleTopEdgePx：字幕區的文字框 y.lo ≤ 此值（縮放後字幕區像素，y=0 為裁切上緣）視為碰到上緣，
+// 表示字幕區切到了畫面中的文字（例如直書漫畫只切到半欄），改辨識整張（10/28，Q6）。
+const subtitleTopEdgePx = 2
+
+// subtitleTouchesTop 回傳是否有文字框碰到字幕區上緣（略過空白文字，同 toBoxes）。
+func subtitleTouchesTop(items []OCRItem) bool {
+	for _, b := range toBoxes(items) {
+		if b.y.lo <= subtitleTopEdgePx {
+			return true
+		}
+	}
+	return false
 }
 
 // OCRItem 是 OCR 讀到的一個文字框：Box 為四個頂點 (x, y)，Text 為框內文字，Score 為信心度。

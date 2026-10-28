@@ -147,7 +147,7 @@ func TestSearchSubmit_PostFailureReasons(t *testing.T) {
 	}{
 		{"超過 25MiB", func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = pipeline.MaxAttachmentSize + 1 }, msgSearchTooLarge},
 		{"下載失敗", func(e *srEnv, m *discordgo.Message) { e.fetch.err = discordtest.ErrInjected }, msgSearchDownloadFailed},
-		{"長度不符", func(e *srEnv, m *discordgo.Message) { m.Attachments[0].Size = 999 }, msgSearchDownloadFailed},
+		// 10/28 Task 1：「長度不符」不再是失敗原因（改為照常貼出，見 TestSearchSubmit_SizeMismatchStillPosts）。
 		{"上傳 413", func(e *srEnv, m *discordgo.Message) {
 			e.fake.FailOn["InteractionResponseEdit"] = restErr(http.StatusRequestEntityTooLarge, 0)
 		}, msgSearchUploadTooLarge},
