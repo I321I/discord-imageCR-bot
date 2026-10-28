@@ -63,7 +63,7 @@
 
 - 附件下載：只在 `Size` > 25MiB 時提早拒絕，不再比對下載長度與 `Size`（Discord 回報的 Size 可能與實際不同）；`HTTPFetcher` 改以 HTTP 回應的 Content-Length（≥ 0 時）偵測截斷（`ErrSizeMismatch`），自動解壓或 chunked（-1）不比對。自動處理與 `/search` 共用。
 - 刪除原訊息遇 Unknown Message（code 10008）視為已刪除成功（記一行 log、不加 ❌）；加／移除反應遇 10008 只記一行短 log。只認 10008，其他錯誤（403 等）仍是處理失敗。
-- OCR 改辨識整張的條件另加：字幕區有任何（非空白）文字框 `y.lo ≤ 2`（縮放後字幕區像素，`subtitleTopEdgePx`），表示切到畫面中的文字（如直書漫畫半欄）。
+- OCR 改辨識整張的條件另加：字幕區有任何（非空白）文字框的上緣落在字幕區高度上方 20% 以內（`y.lo ≤ subtitleTopRegionRatio × 字幕區高度`，`subtitleTopRegionRatio = 0.2`，縮放後字幕區像素），表示切到畫面中的文字（如直書漫畫的最後一字）；字幕樣本的頂端框約在 0.46～0.74，漫畫約 0.05。
 - 作品名稱（取代舊的多名稱組法）：有中文時只放一個——`title.chinese` 優先，其次 synonyms 中第一個中文別名；沒有中文時放 native、english（「、」連接、去重）；兩者都沒有才用 romaji。不做簡轉繁（`title.chinese` 可能是簡體，用「編輯圖片訊息」修正）。
 
 ### OCR worker
